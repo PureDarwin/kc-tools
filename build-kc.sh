@@ -13,7 +13,7 @@ DARWIN=/home/vali/development/darwin
 KEXTS=$DARWIN/PureDarwin/build-install/System/Library/Extensions
 KERNEL=$DARWIN/PureDarwin/build-install/System/Library/Kernels/kernel.debug
 OUT=${1:-$DARWIN/xnu-loader/esp/EFI/BOOT/kernel}
-KCB=$DARWIN/kc-builder/result/bin/kc-builder
+KCB=$DARWIN/kc-tools/result/bin/kc-builder
 
 CODELESS=()
 for p in "$KEXTS"/System.kext/PlugIns/*.kext; do
@@ -36,6 +36,8 @@ REAL=(
   -kext "$KEXTS/HFSEncodings.kext"
   -kext "$KEXTS/hfs.kext"
   -kext "$KEXTS/AppleFileSystemDriver.kext"
+  -kext "$KEXTS/RavynAHCIPort.kext" # thanks Zoe
+  -kext "$KEXTS/IOGOPFramebuffer.kext" # thanks Zoe
 )
 
 set -x

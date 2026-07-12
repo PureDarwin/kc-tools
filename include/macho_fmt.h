@@ -97,6 +97,7 @@ struct dyld_chained_fixups_header {
 #define N_UNDF  0x0
 #define N_ABS   0x2
 #define N_SECT  0xe
+#define N_TYPE  0xe
 #define N_EXT   0x01
 #define N_PEXT  0x10
 #define NO_SECT 0

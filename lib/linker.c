@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 static uint32_t r32(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -206,38 +207,128 @@ uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size) {
 }
 
 int symtab_merge_from_linked(SymTable *st, const LinkedKext *lk) {
-  if (!lk->linked_data || !lk->linked_size)
+  if (!st ||
+    !lk ||
+    !lk->linked_data ||
+    lk->linked_size < sizeof(struct mach_header_64))
+  {
     return 0;
+  }
 
-  const struct mach_header_64 *mh = (const struct mach_header_64 *)lk->linked_data;
+  const uint8_t *data = lk->linked_data;
+  size_t size = lk->linked_size;
+
+  const struct mach_header_64 *mh =
+    (const struct mach_header_64 *)data;
+
   if (mh->magic != MH_MAGIC_64)
     return -1;
 
-  const struct symtab_command *sc = NULL;
-  const uint8_t *lcp = lk->linked_data + sizeof(*mh);
+  const struct symtab_command *symcmd = NULL;
+  const uint8_t *lcp = data + sizeof(*mh);
+
   for (uint32_t i = 0; i < mh->ncmds; i++) {
-    if (r32(lcp) == LC_SYMTAB)
-      sc = (const struct symtab_command *)lcp;
-    lcp += r32(lcp + 4);
+    size_t lc_offset = (size_t)(lcp - data);
+
+    if (lc_offset > size ||
+      size - lc_offset < sizeof(struct load_command)) {
+      return -1;
+    }
+
+    uint32_t cmd = r32(lcp);
+    uint32_t cmdsize = r32(lcp + 4);
+
+    if (cmdsize < sizeof(struct load_command) ||
+      cmdsize > size - lc_offset) {
+      return -1;
+    }
+
+    if (cmd == LC_SYMTAB) {
+      if (cmdsize < sizeof(struct symtab_command))
+        return -1;
+
+      symcmd =
+        (const struct symtab_command *)lcp;
+    }
+
+    lcp += cmdsize;
   }
-  if (!sc)
+
+  if (!symcmd)
     return 0;
 
-  const struct nlist_64 *nl = (const struct nlist_64 *)(lk->linked_data + sc->symoff);
-  const char *strtab = (const char *)(lk->linked_data + sc->stroff);
+  uint64_t symbols_end =
+    (uint64_t)symcmd->symoff +
+    (uint64_t)symcmd->nsyms *
+      sizeof(struct nlist_64);
+
+  uint64_t strings_end =
+    (uint64_t)symcmd->stroff +
+    symcmd->strsize;
+
+  if (symbols_end > size || strings_end > size)
+    return -1;
+
+  const struct nlist_64 *symbols =
+    (const struct nlist_64 *)(data + symcmd->symoff);
+
+  const char *string_table =
+    (const char *)(data + symcmd->stroff);
+
   size_t added = 0;
-  for (uint32_t i = 0; i < sc->nsyms; i++) {
-    const struct nlist_64 *n = &nl[i];
-    // After link_kext writes back n_value, defined external symbols have the final VA.
-    if ((n->n_type & N_EXT) && (n->n_type & 0xe) == N_SECT && n->n_value) {
-      symtab_add(st, strtab + n->n_un.n_strx, n->n_value);
-      added++;
+
+  for (uint32_t i = 0; i < symcmd->nsyms; i++) {
+    const struct nlist_64 *n = &symbols[i];
+
+    if (!(n->n_type & N_EXT))
+      continue;
+
+    if ((n->n_type & N_TYPE) != N_SECT)
+      continue;
+
+    if (!n->n_value || n->n_sect == NO_SECT)
+      continue;
+
+    if (n->n_un.n_strx >= symcmd->strsize)
+      continue;
+
+    const char *name =
+      string_table + n->n_un.n_strx;
+
+    size_t remaining =
+      symcmd->strsize - n->n_un.n_strx;
+
+    if (!memchr(name, '\0', remaining))
+      continue;
+
+    /*
+     * These belong to each individual kext and must never satisfy an
+     * undefined reference from another kext.
+     */
+    if (!strcmp(name, "_kmod_info") ||
+      !strcmp(name, "kmod_info") ||
+      !strcmp(name, "__realmain") ||
+      !strcmp(name, "__antimain") ||
+      !strcmp(name, "__kext_apple_cc")) {
+      continue;
     }
+
+    symtab_add(st, name, n->n_value);
+    added++;
   }
 
   if (added)
-    qsort(st->syms, st->count, sizeof(Sym), sym_cmp);
-  fprintf(stderr, "  merged %zu symbols from %s\n", added, lk->bundle_id);
+    qsort(st->syms,
+        st->count,
+        sizeof(Sym),
+        sym_cmp);
+
+  fprintf(stderr,
+      " merged %zu symbols from %s\n",
+      added,
+      lk->bundle_id
+        ? lk->bundle_id
+        : "<unknown>");
 
   return 0;
 }
@@ -249,77 +340,276 @@ void symtab_free(SymTable *st) {
   memset(st, 0, sizeof(*st));
 }
 
-static uint64_t va_to_foff(const uint8_t *buf, size_t size, uint64_t va) {
-  const struct mach_header_64 *mh = (const struct mach_header_64 *)buf;
+static uint64_t va_to_foff(
+  const uint8_t *buf,
+  size_t size,
+  uint64_t va,
+  size_t access_size)
+{
+  if (!buf || size < sizeof(struct mach_header_64))
+    return UINT64_MAX;
+
+  const struct mach_header_64 *mh =
+    (const struct mach_header_64 *)buf;
+
+  if (mh->magic != MH_MAGIC_64)
+    return UINT64_MAX;
+
   const uint8_t *lcp = buf + sizeof(*mh);
+
   for (uint32_t i = 0; i < mh->ncmds; i++) {
-    uint32_t cmd = r32(lcp), csz = r32(lcp + 4);
+    size_t lc_offset = (size_t)(lcp - buf);
+
+    if (lc_offset > size ||
+      size - lc_offset < sizeof(struct load_command)) {
+      return UINT64_MAX;
+    }
+
+    uint32_t cmd = r32(lcp);
+    uint32_t cmdsize = r32(lcp + 4);
+
+    if (cmdsize < sizeof(struct load_command) ||
+      cmdsize > size - lc_offset) {
+      return UINT64_MAX;
+    }
+
     if (cmd == LC_SEGMENT_64) {
+      if (cmdsize < sizeof(struct segment_command_64))
+        return UINT64_MAX;
+
       const struct segment_command_64 *seg =
         (const struct segment_command_64 *)lcp;
-      if (seg->filesize > 0
-        && va >= seg->vmaddr
-        && va <  seg->vmaddr + seg->filesize)
-      {
-        uint64_t off = seg->fileoff + (va - seg->vmaddr);
-        if (off + 8 <= size)
-          return off;
+
+      size_t required =
+        sizeof(*seg) +
+        (size_t)seg->nsects * sizeof(struct section_64);
+
+      if (required > cmdsize)
+        return UINT64_MAX;
+
+      const struct section_64 *sections =
+        (const struct section_64 *)(seg + 1);
+
+      /*
+       * Prefer section mappings. Segment filesize does not necessarily
+       * describe a simple VA-to-file mapping when a segment contains
+       * gaps or zerofill sections.
+       */
+      for (uint32_t j = 0; j < seg->nsects; j++) {
+        const struct section_64 *sec = &sections[j];
+        uint32_t section_type = sec->flags & SECTION_TYPE;
+
+        if (section_type == S_ZEROFILL
+#ifdef S_GB_ZEROFILL
+          || section_type == S_GB_ZEROFILL
+#endif
+#ifdef S_THREAD_LOCAL_ZEROFILL
+          || section_type == S_THREAD_LOCAL_ZEROFILL
+#endif
+        ) {
+          continue;
+        }
+
+        if (va < sec->addr)
+          continue;
+
+        uint64_t delta = va - sec->addr;
+
+        if (delta > sec->size)
+          continue;
+
+        if ((uint64_t)access_size > sec->size - delta)
+          continue;
+
+        uint64_t file_offset =
+          (uint64_t)sec->offset + delta;
+
+        if (file_offset > size ||
+          access_size > size - (size_t)file_offset) {
+          continue;
+        }
+
+        return file_offset;
       }
-    }
-    lcp += csz;
-  }
-  return (uint64_t)-1;
-}
 
-#define KMOD_OFF_ADDR_64  156
-#define KMOD_OFF_SIZE_64  164
+      /*
+       * Fall back to the segment mapping for bytes such as the Mach-O
+       * header that may not belong to a section.
+       */
+      if (seg->filesize != 0 &&
+        va >= seg->vmaddr) {
+        uint64_t delta = va - seg->vmaddr;
 
-int patch_kmod_info(LinkedKext *lk) {
-  if (!lk->kmod_info_addr) {
-    fprintf(stderr, "  patch_kmod_info: no _kmod_info symbol for %s"
-            ", IDA will show address 0\n", lk->bundle_id);
-    return -1;
-  }
+        if (delta <= seg->filesize &&
+          (uint64_t)access_size <= seg->filesize - delta) {
+          uint64_t file_offset = seg->fileoff + delta;
 
-  uint64_t addr_foff = va_to_foff(lk->linked_data, lk->linked_size,
-                  lk->kmod_info_addr + KMOD_OFF_ADDR_64);
-  uint64_t size_foff = va_to_foff(lk->linked_data, lk->linked_size,
-                  lk->kmod_info_addr + KMOD_OFF_SIZE_64);
-
-  if (addr_foff == (uint64_t)-1 || size_foff == (uint64_t)-1) {
-    fprintf(stderr, "  patch_kmod_info: kmod_info VA 0x%llx not mappable"
-            " to file offset for %s\n",
-        (unsigned long long)lk->kmod_info_addr, lk->bundle_id);
-    return -1;
-  }
-
-  uint64_t text_size = 0;
-  {
-    const uint8_t *lcp = lk->linked_data + sizeof(struct mach_header_64);
-    const struct mach_header_64 *mh =
-      (const struct mach_header_64 *)lk->linked_data;
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
-      uint32_t cmd = r32(lcp), csz = r32(lcp + 4);
-      if (cmd == LC_SEGMENT_64) {
-        const struct segment_command_64 *seg = (const struct segment_command_64 *)lcp;
-        if (!memcmp(seg->segname, "__TEXT", 6)) {
-          text_size = seg->vmsize;
-          break;
+          if (file_offset <= size &&
+            access_size <= size - (size_t)file_offset) {
+            return file_offset;
+          }
         }
       }
-      lcp += csz;
     }
+
+    lcp += cmdsize;
   }
-  if (!text_size)
-    text_size = (uint64_t)lk->linked_size;
 
-  w64(lk->linked_data + addr_foff, lk->load_vmaddr);
-  w64(lk->linked_data + size_foff, text_size);
+  return UINT64_MAX;
+}
 
-  fprintf(stderr, "  patched kmod_info: %s address=0x%llx size=0x%llx\n",
-      lk->bundle_id,
-      (unsigned long long)lk->load_vmaddr,
-      (unsigned long long)text_size);
+#define KMOD_OFF_ADDR_64 156
+#define KMOD_OFF_SIZE_64 164
+
+int patch_kmod_info(LinkedKext *lk) {
+  if (!lk ||
+    !lk->linked_data ||
+    lk->linked_size < sizeof(struct mach_header_64)) {
+    fprintf(stderr,
+        " patch_kmod_info: invalid linked kext\n");
+    return -1;
+  }
+
+  if (!lk->kmod_info_addr) {
+    fprintf(stderr,
+        " patch_kmod_info: no defined _kmod_info symbol for %s\n",
+        lk->bundle_id ? lk->bundle_id : "<unknown>");
+    return -1;
+  }
+
+  /*
+   * A kmod_info symbol belonging to this image must fall inside one of its
+   * mapped segments. This catches accidentally resolved _kmod_info imports
+   * before they patch an unrelated kext.
+   */
+  bool kmod_in_image = false;
+  uint64_t image_start = UINT64_MAX;
+  uint64_t image_end = 0;
+
+  const struct mach_header_64 *mh =
+    (const struct mach_header_64 *)lk->linked_data;
+
+  if (mh->magic != MH_MAGIC_64) {
+    fprintf(stderr,
+        " patch_kmod_info: %s is not MH_MAGIC_64\n",
+        lk->bundle_id ? lk->bundle_id : "<unknown>");
+    return -1;
+  }
+
+  const uint8_t *lcp =
+    lk->linked_data + sizeof(struct mach_header_64);
+
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    size_t lc_offset =
+      (size_t)(lcp - lk->linked_data);
+
+    if (lc_offset > lk->linked_size ||
+      lk->linked_size - lc_offset <
+        sizeof(struct load_command)) {
+      return -1;
+    }
+
+    uint32_t cmd = r32(lcp);
+    uint32_t cmdsize = r32(lcp + 4);
+
+    if (cmdsize < sizeof(struct load_command) ||
+      cmdsize > lk->linked_size - lc_offset) {
+      return -1;
+    }
+
+    if (cmd == LC_SEGMENT_64) {
+      if (cmdsize < sizeof(struct segment_command_64))
+        return -1;
+
+      const struct segment_command_64 *seg =
+        (const struct segment_command_64 *)lcp;
+
+      if (seg->vmsize != 0) {
+        uint64_t seg_end;
+
+        if (UINT64_MAX - seg->vmaddr < seg->vmsize)
+          return -1;
+
+        seg_end = seg->vmaddr + seg->vmsize;
+
+        if (seg->vmaddr < image_start)
+          image_start = seg->vmaddr;
+
+        if (seg_end > image_end)
+          image_end = seg_end;
+
+        if (lk->kmod_info_addr >= seg->vmaddr &&
+          lk->kmod_info_addr < seg_end) {
+          kmod_in_image = true;
+        }
+      }
+    }
+
+    lcp += cmdsize;
+  }
+
+  if (!kmod_in_image) {
+    fprintf(stderr,
+        " patch_kmod_info: %s has foreign kmod_info VA "
+        "0x%llx; image range is 0x%llx-0x%llx\n",
+        lk->bundle_id ? lk->bundle_id : "<unknown>",
+        (unsigned long long)lk->kmod_info_addr,
+        (unsigned long long)image_start,
+        (unsigned long long)image_end);
+    return -1;
+  }
+
+  uint64_t addr_va;
+  uint64_t size_va;
+
+  if (UINT64_MAX - lk->kmod_info_addr < KMOD_OFF_SIZE_64 + 8)
+    return -1;
+
+  addr_va = lk->kmod_info_addr + KMOD_OFF_ADDR_64;
+  size_va = lk->kmod_info_addr + KMOD_OFF_SIZE_64;
+
+  uint64_t addr_foff =
+    va_to_foff(lk->linked_data,
+           lk->linked_size,
+           addr_va,
+           sizeof(uint64_t));
+
+  uint64_t size_foff =
+    va_to_foff(lk->linked_data,
+           lk->linked_size,
+           size_va,
+           sizeof(uint64_t));
+
+  if (addr_foff == UINT64_MAX ||
+    size_foff == UINT64_MAX) {
+    fprintf(stderr,
+        " patch_kmod_info: kmod_info VA 0x%llx not "
+        "mappable to file offsets for %s\n",
+        (unsigned long long)lk->kmod_info_addr,
+        lk->bundle_id ? lk->bundle_id : "<unknown>");
+    return -1;
+  }
+
+  /*
+   * kmod_info.address and kmod_info.size describe the loaded module image,
+   * not merely __TEXT. Use the complete mapped range.
+   */
+  if (image_start == UINT64_MAX || image_end <= image_start)
+    return -1;
+
+  uint64_t image_size = image_end - image_start;
+
+  w64(lk->linked_data + addr_foff, image_start);
+  w64(lk->linked_data + size_foff, image_size);
+
+  fprintf(stderr,
+      " patched kmod_info: %s "
+      "kmod=0x%llx address=0x%llx size=0x%llx\n",
+      lk->bundle_id ? lk->bundle_id : "<unknown>",
+      (unsigned long long)lk->kmod_info_addr,
+      (unsigned long long)image_start,
+      (unsigned long long)image_size);
+
   return 0;
 }
 
@@ -334,6 +624,60 @@ uint64_t symtab_lookup(const SymTable *st, const char *name) {
       lo = mid + 1; else hi = mid;
   }
   return 0;
+}
+
+static uint64_t find_defined_kmod_info(
+    const struct nlist_64 *symbols,
+    uint32_t symbol_count,
+    const char *string_table,
+    size_t string_table_size,
+    const uint64_t *symbol_addresses)
+{
+    if (!symbols ||
+        !string_table ||
+        !symbol_addresses) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < symbol_count; i++) {
+        const struct nlist_64 *n = &symbols[i];
+
+        if (n->n_un.n_strx >= string_table_size)
+            continue;
+
+        const char *name =
+            string_table + n->n_un.n_strx;
+
+        size_t remaining =
+            string_table_size - n->n_un.n_strx;
+
+        if (!memchr(name, '\0', remaining))
+            continue;
+
+        if (strcmp(name, "_kmod_info") != 0 &&
+            strcmp(name, "kmod_info") != 0) {
+            continue;
+        }
+
+        /*
+         * The critical condition: only accept a definition belonging to this
+         * Mach-O. Never accept N_UNDF resolved from a prior kext.
+         */
+        uint8_t type = n->n_type & N_TYPE;
+
+        if (type != N_SECT && type != N_ABS)
+            continue;
+
+        if (type == N_SECT && n->n_sect == NO_SECT)
+            continue;
+
+        if (!symbol_addresses[i])
+            continue;
+
+        return symbol_addresses[i];
+    }
+
+    return 0;
 }
 
 int link_kext(const uint8_t *kext_data, size_t kext_size,
@@ -721,14 +1065,12 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     #undef TARGET_LOC
   }
 
-  uint64_t kmod_info_addr = 0;
-  for (uint32_t i = 0; i < nsyms; i++) {
-    const char *name = strtab + nl[i].n_un.n_strx;
-    if (!strcmp(name, "_kmod_info") || !strcmp(name, "kmod_info")) {
-      kmod_info_addr = sym_addrs[i];
-      break;
-    }
-  }
+  size_t strtab_size = 0;
+
+  if ((uint64_t)symcmd->stroff <= sl)
+    strtab_size = sl - symcmd->stroff;
+
+  uint64_t kmod_info_addr = find_defined_kmod_info(nl, nsyms, strtab, strtab_size, sym_addrs);
 
   free(sym_addrs);
   free(sec_refs);

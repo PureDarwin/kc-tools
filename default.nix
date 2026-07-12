@@ -25,6 +25,6 @@ stdenv.mkDerivation rec {
 
   meta = with lib; {
     description = "Tools for Apple's XNU PrelinkedKernel and KernelCollection formats";
-    platforms = platforms.linux;
+    platforms = platforms.linux ++ platforms.darwin;
   };
 }

@@ -5,7 +5,7 @@ this contains:
 
 ## Building
 Nix is preferred, but CMake works just fine.
-`nix build github:Vali0004/kc-tools` will create a result folder you can just use
+`nix build github:PureDarwin/kc-tools` will create a result folder you can just use
 
 ## Why?
 PureDarwin.

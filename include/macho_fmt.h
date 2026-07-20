@@ -120,6 +120,18 @@ struct dyld_chained_fixups_header {
 #define X86_64_RELOC_SIGNED_4   8
 #define X86_64_RELOC_TLV        9
 
+#define ARM64_RELOC_UNSIGNED            0
+#define ARM64_RELOC_SUBTRACTOR           1
+#define ARM64_RELOC_BRANCH26             2
+#define ARM64_RELOC_PAGE21               3
+#define ARM64_RELOC_PAGEOFF12            4
+#define ARM64_RELOC_GOT_LOAD_PAGE21      5
+#define ARM64_RELOC_GOT_LOAD_PAGEOFF12   6
+#define ARM64_RELOC_POINTER_TO_GOT       7
+#define ARM64_RELOC_TLVP_LOAD_PAGE21     8
+#define ARM64_RELOC_TLVP_LOAD_PAGEOFF12  9
+#define ARM64_RELOC_ADDEND               10
+
 struct mach_header_64 {
   uint32_t magic;
   int32_t cputype;

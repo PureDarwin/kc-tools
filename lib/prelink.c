@@ -67,10 +67,6 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   // prelink_text_fileoff only depends on kernel_size, so it's safe here.
   size_t prelink_text_fileoff = ALIGN_UP(kernel_size, PAGE);
 
-  // Build the plist now that prelink_text_fileoff is known.
-  // XNU (bootstrap.cpp) deserializes this as OSDictionary, then reads
-  // the kext array from "_PrelinkInfoDictionary" (OSKext.cpp:9805).
-  // IDA's XNU loader expects the same outer-dict wrapper.
   PlistNode *info_array = plist_new_array();
   for (size_t i = 0; i < num_kexts; i++) {
     LinkedKext *k = &kexts[i];
@@ -91,8 +87,6 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
       plist_dict_set(dict, "_PrelinkExecutableSourceAddr",  plist_new_integer(k->load_vmaddr));
       plist_dict_set(dict, "_PrelinkKmodInfo",              plist_new_integer(k->kmod_info_addr));
     }
-    // Codeless kexts carry no _PrelinkExecutable* keys — XNU treats the absent
-    // load address as a codeless (symbol/dependency-only) kext.
     plist_array_append(info_array, dict);
   }
   PlistNode *info_root = plist_new_dict();

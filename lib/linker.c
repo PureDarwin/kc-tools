@@ -135,7 +135,7 @@ static const uint8_t *find_slice(const uint8_t *data, size_t size, size_t *out_s
       int32_t ct = (int32_t)((uint32_t)fa[0] << 24 | (uint32_t)fa[1] << 16 | (uint32_t)fa[2] << 8  | fa[3]);
       uint32_t off = (uint32_t)fa[8]  << 24 | (uint32_t)fa[9]  << 16 | (uint32_t)fa[10] << 8  | fa[11];
       uint32_t sz = (uint32_t)fa[12] << 24 | (uint32_t)fa[13] << 16 | (uint32_t)fa[14] << 8  | fa[15];
-      if (ct == CPU_TYPE_X86_64 && off + sz <= size) {
+      if ((ct == CPU_TYPE_X86_64 || ct == CPU_TYPE_ARM64) && off + sz <= size) {
         *out_sz = sz;
         return data + off;
       }
@@ -810,8 +810,110 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
             continue;
 
           const struct relocation_info *relocs = (const struct relocation_info *)(buf + sec->reloff);
+          int64_t pending_addend = 0;
           for (uint32_t ri = 0; ri < sec->nreloc; ri++) {
             struct relocation_info r = relocs[ri];
+
+            if (mh->cputype == CPU_TYPE_ARM64) {
+              if (r.r_type == ARM64_RELOC_ADDEND) {
+                int32_t a = (int32_t)(r.r_symbolnum << 8) >> 8;
+                pending_addend = a;
+                continue;
+              }
+
+              if (r.r_type == ARM64_RELOC_SUBTRACTOR) {
+                if (ri + 1 >= sec->nreloc) { pending_addend = 0; continue; }
+                struct relocation_info r2 = relocs[++ri];
+                if ((uint32_t)r.r_address + 8 > sec->size) { pending_addend = 0; continue; }
+                uint8_t *loc = buf + sec->offset + r.r_address;
+                uint64_t sym_b = r.r_extern  ? sym_addrs[r.r_symbolnum]
+                                             : (r.r_symbolnum  ? sec_refs[r.r_symbolnum - 1].vmaddr  : load_vmaddr);
+                uint64_t sym_a = r2.r_extern ? sym_addrs[r2.r_symbolnum]
+                                             : (r2.r_symbolnum ? sec_refs[r2.r_symbolnum - 1].vmaddr : load_vmaddr);
+                uint64_t addend = (r2.r_length == RL_QUAD) ? r64(loc) : (uint64_t)(uint32_t)r32(loc);
+                uint64_t val = sym_a - sym_b + addend + (uint64_t)pending_addend;
+                if (r2.r_length == RL_QUAD)
+                  w64(loc, val);
+                else
+                  w32(loc, (uint32_t)val);
+                pending_addend = 0;
+                continue;
+              }
+
+              if ((uint32_t)r.r_address >= sec->size) { pending_addend = 0; continue; }
+
+              uint8_t *loc = buf + sec->offset + r.r_address;
+              uint64_t pc  = sec->addr + (uint32_t)r.r_address;
+
+              uint64_t target = 0;
+              if (r.r_extern) {
+                if (r.r_symbolnum < nsyms)
+                  target = sym_addrs[r.r_symbolnum];
+                if (!target) nerrs++;
+              } else {
+                uint32_t si2 = r.r_symbolnum;
+                if (si2 >= 1 && si2 <= total_sects)
+                  target = sec_refs[si2 - 1].vmaddr;
+              }
+              target += (uint64_t)pending_addend;
+              pending_addend = 0;
+
+              switch (r.r_type) {
+              case ARM64_RELOC_UNSIGNED: {
+                uint64_t addend = r64(loc);
+                w64(loc, target + addend);
+                break;
+              }
+              case ARM64_RELOC_BRANCH26: {
+                uint32_t insn = r32(loc);
+                int64_t rel = (int64_t)target - (int64_t)pc;
+                w32(loc, (insn & 0xFC000000u) | (((uint32_t)(rel >> 2)) & 0x03FFFFFFu));
+                break;
+              }
+              case ARM64_RELOC_PAGE21:
+              case ARM64_RELOC_GOT_LOAD_PAGE21:
+              case ARM64_RELOC_TLVP_LOAD_PAGE21: {
+                uint32_t insn = r32(loc);
+                int64_t delta = (int64_t)((target & ~0xFFFULL) - (pc & ~0xFFFULL));
+                int64_t imm21 = delta >> 12;
+                uint32_t immlo = (uint32_t)imm21 & 0x3u;
+                uint32_t immhi = ((uint32_t)imm21 >> 2) & 0x7FFFFu;
+                insn &= ~((0x3u << 29) | (0x7FFFFu << 5));
+                insn |= (immlo << 29) | (immhi << 5);
+                w32(loc, insn);
+                break;
+              }
+              case ARM64_RELOC_PAGEOFF12:
+              case ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+              case ARM64_RELOC_TLVP_LOAD_PAGEOFF12: {
+                uint32_t insn = r32(loc);
+                uint32_t off12 = (uint32_t)(target & 0xFFFu);
+                uint32_t scale = 1;
+                if ((insn & 0x3B000000u) == 0x39000000u) {
+                  uint32_t size = (insn >> 30) & 0x3u;
+                  uint32_t v    = (insn >> 26) & 0x1u;
+                  uint32_t opc  = (insn >> 23) & 0x3u;
+                  if (v && size == 0 && (opc & 0x2u))
+                    scale = 16;
+                  else
+                    scale = 1u << size;
+                }
+                uint32_t imm12 = off12 / scale;
+                insn &= ~(0xFFFu << 10);
+                insn |= (imm12 & 0xFFFu) << 10;
+                w32(loc, insn);
+                break;
+              }
+              case ARM64_RELOC_POINTER_TO_GOT: {
+                w64(loc, target);
+                break;
+              }
+              default:
+                fprintf(stderr, "  WARN: unhandled arm64 reloc type %u\n", r.r_type);
+                break;
+              }
+              continue;
+            }
 
             if (r.r_type == X86_64_RELOC_SUBTRACTOR) {
               if (ri + 1 >= sec->nreloc) continue;

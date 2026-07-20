@@ -13,26 +13,6 @@ typedef struct {
   const struct segment_command_64 *lc;  // pointer into kernel_data
 } SegRef;
 
-// Earlier revisions of this tool appended a separate synthetic "__KCHDR"
-// segment (its own mach_header_64 + load commands) after the whole image,
-// carrying the MH_FILESET wrapper. That broke XNU's kernel_collection_slide()
-// (osfmk/mach/dyld_kernel_fixups.h): it derives its own internal "slide" as
-// (uintptr_t)kc_mh - textVMAddr, where textVMAddr comes from kc_mh's own
-// copy of the __TEXT segment command. Real Apple KCs have their MH_FILESET
-// header co-located with the image's own __TEXT (so that delta is always
-// the genuine KASLR slide, 0 here); our appended-at-the-end __KCHDR made it
-// a huge bogus value, and every subsequent address computation (including
-// the chained-fixups header address) landed in unmapped memory.
-//
-// Fix: convert the kernel's OWN mach_header_64 in place into the MH_FILESET
-// header, append LC_FILESET_ENTRY (kernel + each real kext) and
-// LC_DYLD_CHAINED_FIXUPS directly onto its EXISTING load command list,
-// reusing its EXISTING LC_SEGMENT_64 entries verbatim (no separate segment
-// copies needed). This makes kc_mh and textVMAddr the literal same object,
-// so that internal slide is trivially 0 by construction, no address
-// arithmetic to get wrong. Apple kernels reserve generous zero padding
-// between the end of their load commands and the first real segment's file
-// content specifically to allow this kind of in-place growth.
 int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                      LinkedKext *kexts, size_t num_kexts,
                      uint8_t **out_data, size_t *out_size)
@@ -182,15 +162,6 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   size_t hdr_cmds_end = sizeof(*mh) + mh->sizeofcmds;
   size_t new_cmds_off = hdr_cmds_end;                                // where the new LCs start
 
-  // The chained-fixups DATA blob must live inside __LINKEDIT's own file
-  // range: kernel_collection_slide() computes its address as linkeditVMAddr
-  // + (dataoff - linkeditFileOffset), which only lands correctly if dataoff
-  // shares __LINKEDIT's fileoff<->vmaddr delta, true for any byte actually
-  // inside __LINKEDIT, false everywhere else (this is what broke the
-  // earlier "put it in the header padding" attempt: __TEXT's delta differs
-  // from __LINKEDIT's). We reuse the page-alignment slack Apple's own
-  // toolchain already leaves between __LINKEDIT's real content and the next
-  // segment's file data, rather than shifting the whole file.
   size_t linkedit_off = 0, linkedit_fileoff = 0, linkedit_filesize = 0;
   uint64_t linkedit_vmsize = 0;
   uint64_t next_seg_fileoff = base_size;

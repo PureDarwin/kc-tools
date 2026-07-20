@@ -166,9 +166,6 @@ static void skip_until(P *p, const char *end) {
   }
 }
 
-// Advance past the remainder of a tag (up to and including '>').  Returns 1 if
-// the tag was self-closing (e.g. "<dict/>", "<true/>"), i.e. the last char
-// before '>' was '/'.  Callers must NOT recurse into a self-closed container.
 static int skip_tag_rest(P *p) {
   int self_closing = 0;
   while (p->p < p->end && *p->p != '>') {

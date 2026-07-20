@@ -17,17 +17,15 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                      LinkedKext *kexts, size_t num_kexts,
                      uint8_t **out_data, size_t *out_size)
 {
-  // If there are kexts, first produce a classic prelinked image (kexts placed
-  // in __PRELINK_TEXT, _PrelinkInfoDictionary in __PRELINK_INFO). Then wrap it
-  // as a fileset. This reuses all of prelink.c's kext placement + plist logic;
-  // the only fileset-specific work is the MH_FILESET wrapper below.
   uint8_t *base_data = (uint8_t *)kernel_data;
-  size_t   base_size = kernel_size;
-  int      base_owned = 0;
+  size_t base_size = kernel_size;
+  int base_owned = 0;
+  size_t  *header_foffs = num_kexts ? calloc(num_kexts, sizeof(size_t)) : NULL;
   if (num_kexts > 0) {
-    if (prelink_assemble(kernel_data, kernel_size, kexts, num_kexts,
-                         &base_data, &base_size) != 0) {
-      fprintf(stderr, "fileset: prelink_assemble failed\n");
+    if (prelink_assemble_merged(kernel_data, kernel_size, kexts, num_kexts,
+                                &base_data, &base_size, header_foffs) != 0) {
+      fprintf(stderr, "fileset: prelink_assemble_merged failed\n");
+      free(header_foffs);
       return -1;
     }
     base_owned = 1;
@@ -71,13 +69,11 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
     }
   }
 
-  if (base_owned && prelink_text) {
-    uint64_t pt_vmaddr  = prelink_text->vmaddr;
-    uint64_t pt_fileoff = prelink_text->fileoff;
+  if (base_owned && header_foffs) {
     for (size_t i = 0; i < num_kexts; i++) {
-      if (kexts[i].load_vmaddr < pt_vmaddr) continue;
-      size_t koff = pt_fileoff + (kexts[i].load_vmaddr - pt_vmaddr);
-      if (koff + sizeof(struct mach_header_64) > base_size) continue;
+      if (kexts[i].codeless) continue;
+      size_t koff = header_foffs[i];
+      if (koff == 0 || koff + sizeof(struct mach_header_64) > base_size) continue;
       struct mach_header_64 *kmh = (struct mach_header_64 *)(base_data + koff);
       if (kmh->magic == MH_MAGIC_64)
         kmh->flags |= MH_DYLIB_IN_CACHE;
@@ -114,6 +110,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
         if (segs[i]->vmsize > 0 && segs[i]->vmaddr + segs[i]->vmsize > kernel_vm_end)
           kernel_vm_end = segs[i]->vmaddr + segs[i]->vmsize;
     }
+
   }
 
   fprintf(stderr, "fileset: kernel hdr vmaddr=0x%llx vm_end=0x%llx segs=%zu\n",
@@ -147,11 +144,6 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   for (size_t i = 0; i < n_kext_fe; i++)
     if (kext_fe_cmdsize[i]) n_real_fe++;
 
-  // New commands appended to the kernel's EXISTING load command list: 1
-  // LC_FILESET_ENTRY (kernel, self-referential) + one per real kext + 1
-  // LC_DYLD_CHAINED_FIXUPS. No LC_SEGMENT_64 copies needed, the kernel's
-  // own existing segment list already is what kernel_collection_slide()
-  // needs to walk (see the big comment at the top of this file).
   uint32_t new_ncmds = 1 + n_real_fe + 1;
   uint32_t new_cmds_size = fe_cmdsize + kext_fe_total + chained_cmdsize;
 
@@ -277,8 +269,8 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
     uint32_t idlen = (uint32_t)strlen(kexts[i].bundle_id) + 1;
     ke->cmd = LC_FILESET_ENTRY;
     ke->cmdsize = kext_fe_cmdsize[i];
-    ke->vmaddr = kexts[i].load_vmaddr;
-    ke->fileoff = pt_fileoff + (kexts[i].load_vmaddr - pt_vmaddr);
+    ke->vmaddr = kexts[i].header_vmaddr;
+    ke->fileoff = header_foffs ? header_foffs[i] : 0;
     ke->entry_id = (uint32_t)sizeof(struct fileset_entry_command);
     ke->reserved = 0;
     memcpy(p + ke->entry_id, kexts[i].bundle_id, idlen);
@@ -316,5 +308,6 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
 
   *out_data = out;
   *out_size = base_size;
+  free(header_foffs);
   return 0;
 }

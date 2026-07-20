@@ -206,6 +206,32 @@ uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size) {
   return highest;
 }
 
+int macho_find_segment(const uint8_t *data, size_t size, const char *segname,
+                       uint64_t *vmaddr, uint64_t *vmsize) {
+  size_t sl;
+  const uint8_t *s = find_slice(data, size, &sl);
+  if (!s)
+    return 0;
+
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)s;
+  const uint8_t *lc = s + sizeof(*mh);
+  size_t namelen = strlen(segname);
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    uint32_t cmd = r32(lc), sz = r32(lc + 4);
+    if (cmd == LC_SEGMENT_64) {
+      const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
+      if (!strncmp(sc->segname, segname, namelen < 16 ? namelen : 16) &&
+          (namelen >= 16 || sc->segname[namelen] == '\0')) {
+        if (vmaddr) *vmaddr = sc->vmaddr;
+        if (vmsize) *vmsize = sc->vmsize;
+        return 1;
+      }
+    }
+    lc += sz;
+  }
+  return 0;
+}
+
 int symtab_merge_from_linked(SymTable *st, const LinkedKext *lk) {
   if (!st ||
     !lk ||
@@ -680,9 +706,20 @@ static uint64_t find_defined_kmod_info(
     return 0;
 }
 
-int link_kext(const uint8_t *kext_data, size_t kext_size,
+struct SegSlideEntry { uint64_t orig_start, orig_end, slide; };
+
+static uint64_t slide_for_orig_addr(struct SegSlideEntry *tab, uint32_t n,
+                                    uint64_t orig_addr, uint64_t fallback) {
+  for (uint32_t i = 0; i < n; i++)
+    if (orig_addr >= tab[i].orig_start && orig_addr < tab[i].orig_end)
+      return tab[i].slide;
+  return fallback;
+}
+
+static int link_kext_impl(const uint8_t *kext_data, size_t kext_size,
               const SymTable *kernel_syms,
               uint64_t load_vmaddr,
+              KcPlacement *pl,
               LinkedKext *out)
 {
   size_t sl;
@@ -703,18 +740,57 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   SegInfo seginfo[32];
   uint32_t nseginfo = 0;
 
+  uint64_t sect_slide[256];
+  uint32_t nsect_slide = 0;
+  struct SegSlideEntry seg_slide_tab[32];
+  uint32_t nseg_slide = 0;
+  uint64_t header_vmaddr = 0;
+  int header_vmaddr_set = 0;
+
+  #define PAGE_ALIGN(x) (((uint64_t)(x) + 0xFFFULL) & ~0xFFFULL)
+
   uint8_t *lcp = buf + sizeof(*mh);
   for (uint32_t i = 0; i < mh->ncmds; i++) {
     uint32_t cmd = r32(lcp), sz = r32(lcp + 4);
     if (cmd == LC_SEGMENT_64) {
       struct segment_command_64 *seg = (struct segment_command_64 *)lcp;
-      seg->vmaddr += load_vmaddr;
+      uint64_t orig_vmaddr = seg->vmaddr;
+      uint64_t seg_slide;
+      if (pl) {
+        uint64_t *cursor;
+        if (!memcmp(seg->segname, "__TEXT", 6))
+          cursor = &pl->text_exec_cursor;
+        else if (!memcmp(seg->segname, "__DATA_CONST", 12))
+          cursor = &pl->data_const_cursor;
+        else
+          cursor = &pl->data_cursor;
+        uint64_t new_vmaddr = PAGE_ALIGN(*cursor);
+        *cursor = new_vmaddr + PAGE_ALIGN(seg->vmsize ? seg->vmsize : 1);
+        seg_slide = new_vmaddr - orig_vmaddr;
+        seg->vmaddr = new_vmaddr;
+      } else {
+        seg_slide = load_vmaddr;
+        seg->vmaddr += load_vmaddr;
+      }
+      if (!header_vmaddr_set && seg->fileoff == 0) {
+        header_vmaddr = seg->vmaddr;
+        header_vmaddr_set = 1;
+      }
+      if (nseg_slide < 32) {
+        seg_slide_tab[nseg_slide].orig_start = orig_vmaddr;
+        seg_slide_tab[nseg_slide].orig_end = orig_vmaddr + seg->vmsize;
+        seg_slide_tab[nseg_slide].slide = seg_slide;
+        nseg_slide++;
+      }
       struct section_64 *secs = (struct section_64 *)(seg + 1);
-      for (uint32_t j = 0; j < seg->nsects; j++)
-        secs[j].addr += load_vmaddr;
+      for (uint32_t j = 0; j < seg->nsects; j++) {
+        secs[j].addr += seg_slide;
+        if (nsect_slide < 256)
+          sect_slide[nsect_slide++] = seg_slide;
+      }
       if (nseginfo < 32) {
         seginfo[nseginfo].fileoff = seg->fileoff;
-        seginfo[nseginfo].vmaddr = seg->vmaddr - load_vmaddr;
+        seginfo[nseginfo].vmaddr = orig_vmaddr;
         seginfo[nseginfo].filesize = seg->filesize;
         nseginfo++;
       }
@@ -725,6 +801,9 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     }
     lcp += sz;
   }
+
+  if (!header_vmaddr_set)
+    header_vmaddr = load_vmaddr;
 
   if (!symcmd) {
     fprintf(stderr, "link_kext: no LC_SYMTAB\n");
@@ -744,13 +823,9 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     const struct nlist_64 *n = &nl[i];
     uint8_t type = n->n_type & 0x0e;
     if (type == N_SECT) {
-      // n_value is the symbol's vmaddr in the *original* (pre-slide) address space.
-      // After the segment patch loop above, section.addr = original + load_vmaddr.
-      //
-      // So the symbol's final VA = (n_value - original_seg_vmaddr) + final_seg_vmaddr.
-      // For kexts compiled at vmbase 0 this reduces to load_vmaddr + n_value, which is fine.
-      // But store it as-is and let the write-back be the canonical source
-      nl_mut[i].n_value = load_vmaddr + n->n_value;
+      uint64_t slide = (n->n_sect >= 1 && n->n_sect <= nsect_slide)
+                        ? sect_slide[n->n_sect - 1] : load_vmaddr;
+      nl_mut[i].n_value = n->n_value + slide;
       sym_addrs[i] = nl_mut[i].n_value;
     } else if (type == N_ABS) {
       sym_addrs[i] = n->n_value;
@@ -1034,7 +1109,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
         case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
           for (uint32_t k = 0; k < imm; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) w64(loc, r64(loc) + load_vmaddr);
+            if (loc) { uint64_t ov = r64(loc); w64(loc, ov + slide_for_orig_addr(seg_slide_tab, nseg_slide, ov, load_vmaddr)); }
             seg_off += 8;
           }
           break;
@@ -1042,14 +1117,14 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint64_t cnt = read_uleb(&p, end);
           for (uint64_t k = 0; k < cnt; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) w64(loc, r64(loc) + load_vmaddr);
+            if (loc) { uint64_t ov = r64(loc); w64(loc, ov + slide_for_orig_addr(seg_slide_tab, nseg_slide, ov, load_vmaddr)); }
             seg_off += 8;
           }
           break;
         }
         case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: {
           uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-          if (loc) w64(loc, r64(loc) + load_vmaddr);
+          if (loc) { uint64_t ov = r64(loc); w64(loc, ov + slide_for_orig_addr(seg_slide_tab, nseg_slide, ov, load_vmaddr)); }
           seg_off += 8 + read_uleb(&p, end);
           break;
         }
@@ -1058,7 +1133,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint64_t skip = read_uleb(&p, end);
           for (uint64_t k = 0; k < cnt; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) w64(loc, r64(loc) + load_vmaddr);
+            if (loc) { uint64_t ov = r64(loc); w64(loc, ov + slide_for_orig_addr(seg_slide_tab, nseg_slide, ov, load_vmaddr)); }
             seg_off += 8 + skip;
           }
           break;
@@ -1180,6 +1255,19 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   out->linked_data = buf;
   out->linked_size = sl;
   out->load_vmaddr = load_vmaddr;
+  out->header_vmaddr = header_vmaddr;
   out->kmod_info_addr = kmod_info_addr;
   return 0;
+}
+
+int link_kext(const uint8_t *kext_data, size_t kext_size,
+              const SymTable *kernel_syms, uint64_t load_vmaddr,
+              LinkedKext *out) {
+  return link_kext_impl(kext_data, kext_size, kernel_syms, load_vmaddr, NULL, out);
+}
+
+int link_kext_placed(const uint8_t *kext_data, size_t kext_size,
+                     const SymTable *kernel_syms, uint64_t file_anchor_vmaddr,
+                     KcPlacement *placement, LinkedKext *out) {
+  return link_kext_impl(kext_data, kext_size, kernel_syms, file_anchor_vmaddr, placement, out);
 }

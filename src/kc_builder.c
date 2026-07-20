@@ -205,8 +205,45 @@ int main(int argc, char *argv[]) {
   uint64_t kvm_end = macho_kernel_vm_end(kernel_data, kernel_size);
   kvm_end = (kvm_end + 0xFFFF) & ~(uint64_t)0xFFFF; // align to 64 KB
 
-  uint64_t vmcursor = kext_vmbase ? kext_vmbase : kvm_end;
+  uint64_t vmcursor;
+  if (kext_vmbase) {
+    vmcursor = kext_vmbase;
+  } else if (classic) {
+    // arm_vm_prot_init() (arm64-only) walks every named segment with hardcoded adjacency arithmetic, e.g.
+    //   RWNX(segPLKDATACONSTB + segSizePLKDATACONST,
+    //        segTEXTB - (segPLKDATACONSTB + segSizePLKDATACONST))
+    // which underflows unless the coalesced kext blob ends at or below the kernel's own __TEXT
+    uint64_t text_va = 0;
+    if (macho_find_segment(kernel_data, kernel_size, "__TEXT", &text_va, NULL)) {
+      uint64_t budget = 0;
+      for (int i = 0; i < nkexts; i++)
+        budget += (kbundles[i].binary_size + 0xFFF) & ~(uint64_t)0xFFF;
+      budget = (budget * 2 + 0xFFFF) & ~(uint64_t)0xFFFF; // slop for growth
+      if (budget < 0x100000) budget = 0x100000;
+      vmcursor = (text_va - budget) & ~(uint64_t)0xFFFF;
+    } else {
+      vmcursor = kvm_end;
+    }
+  } else {
+    vmcursor = kvm_end;
+  }
   fprintf(stderr, "kext placement start: 0x%llx\n", (unsigned long long)vmcursor);
+
+  KcPlacement placement;
+  int use_placement = !classic;
+  if (use_placement) {
+    uint64_t last_va = 0, last_sz = 0, lastdc_va = 0, lastdc_sz = 0, plkdata_va = 0;
+    macho_find_segment(kernel_data, kernel_size, "__LAST", &last_va, &last_sz);
+    macho_find_segment(kernel_data, kernel_size, "__LASTDATA_CONST", &lastdc_va, &lastdc_sz);
+    macho_find_segment(kernel_data, kernel_size, "__PRELINK_DATA", &plkdata_va, NULL);
+    placement.text_exec_cursor = last_va + last_sz;
+    placement.data_const_cursor = lastdc_va + lastdc_sz;
+    placement.data_cursor = plkdata_va;
+    fprintf(stderr, "kc placement: text_exec=0x%llx data_const=0x%llx data=0x%llx\n",
+            (unsigned long long)placement.text_exec_cursor,
+            (unsigned long long)placement.data_const_cursor,
+            (unsigned long long)placement.data_cursor);
+  }
 
   LinkedKext linked[MAX_KEXTS];
   int nlinked = 0;
@@ -225,7 +262,10 @@ int main(int argc, char *argv[]) {
     lk->info_plist_xml = kb->info_plist_xml;
     lk->info_plist_len = kb->info_plist_len;
 
-    if (link_kext(kb->binary, kb->binary_size, &ksyms, vmcursor, lk) != 0) {
+    int rc = use_placement
+        ? link_kext_placed(kb->binary, kb->binary_size, &ksyms, vmcursor, &placement, lk)
+        : link_kext(kb->binary, kb->binary_size, &ksyms, vmcursor, lk);
+    if (rc != 0) {
       fprintf(stderr, "link_kext failed for %s (skipping)\n", kb->id);
       continue;
     }
@@ -239,6 +279,17 @@ int main(int argc, char *argv[]) {
   if (nkexts > 0 && nlinked == 0) {
     fprintf(stderr, "No kexts linked\n");
     return 1;
+  }
+
+  if (classic && !kext_vmbase) {
+    uint64_t text_va = 0;
+    if (macho_find_segment(kernel_data, kernel_size, "__TEXT", &text_va, NULL) &&
+        vmcursor > text_va) {
+      fprintf(stderr, "classic prelink blob (ends 0x%llx) ran into kernel __TEXT "
+                       "(0x%llx) - increase the placement budget\n",
+              (unsigned long long)vmcursor, (unsigned long long)text_va);
+      return 1;
+    }
   }
 
   for (int i = 0; i < num_codeless_paths; i++) {

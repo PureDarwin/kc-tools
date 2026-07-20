@@ -20,11 +20,11 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   uint8_t *base_data = (uint8_t *)kernel_data;
   size_t base_size = kernel_size;
   int base_owned = 0;
-  size_t  *header_foffs = num_kexts ? calloc(num_kexts, sizeof(size_t)) : NULL;
+  size_t *header_foffs = num_kexts ? calloc(num_kexts, sizeof(size_t)) : NULL;
   if (num_kexts > 0) {
-    if (prelink_assemble_merged(kernel_data, kernel_size, kexts, num_kexts,
-                                &base_data, &base_size, header_foffs) != 0) {
-      fprintf(stderr, "fileset: prelink_assemble_merged failed\n");
+    if (prelink_assemble_kc(kernel_data, kernel_size, kexts, num_kexts,
+                            &base_data, &base_size, header_foffs) != 0) {
+      fprintf(stderr, "fileset: prelink_assemble_kc failed\n");
       free(header_foffs);
       return -1;
     }
@@ -85,33 +85,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
       if (first_seg_vmaddr == 0 || segs[i]->vmaddr < first_seg_vmaddr)
         first_seg_vmaddr = segs[i]->vmaddr;
   }
-  (void)prelink_info; (void)kexts; (void)num_kexts;
-
-  if (base_owned) { // only when we produced a prelinked base (kexts present)
-    uint64_t prelink_end = 0;
-    struct segment_command_64 *linkedit = NULL;
-    for (size_t i = 0; i < nsegs; i++) {
-      if (!memcmp(segs[i]->segname, "__PRELINK_TEXT", 14) ||
-          !memcmp(segs[i]->segname, "__PRELINK_INFO", 14)) {
-        uint64_t e = segs[i]->vmaddr + segs[i]->vmsize;
-        if (e > prelink_end) prelink_end = e;
-      }
-      if (!memcmp(segs[i]->segname, "__LINKEDIT", 11))
-        linkedit = (struct segment_command_64 *)segs[i]; // base_data is mutable
-    }
-    if (linkedit && prelink_end && linkedit->vmaddr < prelink_end) {
-      uint64_t new_va = ALIGN_UP(prelink_end, PAGE);
-      fprintf(stderr, "fileset: moving __LINKEDIT vmaddr 0x%llx -> 0x%llx (after __PRELINK_TEXT)\n",
-              (unsigned long long)linkedit->vmaddr, (unsigned long long)new_va);
-      linkedit->vmaddr = new_va;
-      // recompute kernel_vm_end
-      kernel_vm_end = 0;
-      for (size_t i = 0; i < nsegs; i++)
-        if (segs[i]->vmsize > 0 && segs[i]->vmaddr + segs[i]->vmsize > kernel_vm_end)
-          kernel_vm_end = segs[i]->vmaddr + segs[i]->vmsize;
-    }
-
-  }
+  (void)prelink_info; (void)prelink_text; (void)kexts; (void)num_kexts;
 
   fprintf(stderr, "fileset: kernel hdr vmaddr=0x%llx vm_end=0x%llx segs=%zu\n",
           (unsigned long long)first_seg_vmaddr,
@@ -121,14 +95,9 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   uint32_t fe_idlen = (uint32_t)sizeof(kernel_entry_id); // incl NUL
   uint32_t fe_cmdsize = (uint32_t)ALIGN_UP(sizeof(struct fileset_entry_command) + fe_idlen, 8);
 
-  // Per-kext fileset entries: one LC_FILESET_ENTRY per kext,
-  // entry_id = bundle id, vmaddr = kext load address, fileoff = its offset
-  // within the KC file.
-  uint64_t pt_vmaddr  = prelink_text ? prelink_text->vmaddr  : 0;
-  uint64_t pt_fileoff = prelink_text ? prelink_text->fileoff : 0;
   uint32_t kext_fe_cmdsize[64];
   uint32_t kext_fe_total = 0;
-  size_t   n_kext_fe = (prelink_text ? num_kexts : 0);
+  size_t n_kext_fe = num_kexts;
   if (n_kext_fe > 64) n_kext_fe = 64;
   for (size_t i = 0; i < n_kext_fe; i++) {
     if (kexts[i].codeless) { kext_fe_cmdsize[i] = 0; continue; }  // no segments
@@ -249,6 +218,30 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
     le->vmsize = linkedit_vmsize + grew;
   }
 
+  // Kernel-only KC (no kexts): prelink_assemble_kc never ran, so still do
+  // the baseline __DATA_CONST/__DATA growth to satisfy arm_vm_init's
+  // containment asserts against __LASTDATA_CONST/__PRELINK_DATA.
+  if (!base_owned) {
+    struct segment_command_64 *dc = NULL, *ldc = NULL, *data = NULL;
+    uint64_t pd_vmaddr = 0;
+    uint8_t *lcp2 = out + sizeof(*omh);
+    for (uint32_t i = 0; i < omh->ncmds; i++) {
+      struct load_command *lc = (struct load_command *)lcp2;
+      if (lc->cmd == LC_SEGMENT_64) {
+        struct segment_command_64 *sc = (struct segment_command_64 *)lcp2;
+        if (!memcmp(sc->segname, "__DATA_CONST", 13)) dc = sc;
+        else if (!memcmp(sc->segname, "__LASTDATA_CONST", 17)) ldc = sc;
+        else if (!memcmp(sc->segname, "__DATA", 7)) data = sc;
+        else if (!memcmp(sc->segname, "__PRELINK_DATA", 15)) pd_vmaddr = sc->vmaddr;
+      }
+      lcp2 += lc->cmdsize;
+    }
+    if (dc && ldc && ldc->vmaddr + ldc->vmsize > dc->vmaddr + dc->vmsize)
+      dc->vmsize = (ldc->vmaddr + ldc->vmsize) - dc->vmaddr;
+    if (data && pd_vmaddr && data->vmaddr + data->vmsize < pd_vmaddr)
+      data->vmsize = pd_vmaddr - data->vmaddr;
+  }
+
   uint8_t *p = out + new_cmds_off;
 
   // LC_FILESET_ENTRY for the kernel itself: self-referential, since kc_mh
@@ -277,11 +270,6 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
     p += kext_fe_cmdsize[i];
   }
 
-  // LC_DYLD_CHAINED_FIXUPS -> empty blob, placed inside __LINKEDIT's own
-  // trailing padding (see the big comment above fixups_off's computation).
-  // kc_mh and the value used as "textVMAddr" internally by
-  // kernel_collection_slide() are now the same object's own header, so its
-  // internal slide is exactly 0 by construction.
   struct linkedit_data_command *cf = (struct linkedit_data_command *)p;
   cf->cmd = LC_DYLD_CHAINED_FIXUPS;
   cf->cmdsize = chained_cmdsize;

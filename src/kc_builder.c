@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 
 #include "linker.h"
+#include "macho_fmt.h"
 #include "plist.h"
 #include "prelink.h"
 
@@ -123,20 +124,7 @@ static int load_kext(const char *kext_dir, const char *prefix, KextBundle *out) 
 static void usage(const char *prog) {
   fprintf(stderr,
     "Usage: %s -kernel <file> -kext <dir.kext> [...] -o <output>\n"
-    "       [-prefix /System/Library/Extensions] [-kext-vmbase <hex>] [-classic]\n"
-    "\n"
-    "  Builds a prelinked kernel Mach-O from a base kernel and kext bundles.\n"
-    "  Links each kext against the kernel symbol table, applies x86_64\n"
-    "  relocations, then assembles the __PRELINK_TEXT/__PRELINK_INFO segments.\n"
-    "\n"
-    "  By default wraps the result as an MH_FILESET kernel collection\n"
-    "  (fileset_assemble). -classic instead writes the plain prelinked\n"
-    "  kernel Mach-O (prelink_assemble's output, filetype MH_EXECUTE) with\n"
-    "  no __KCHDR/MH_FILESET wrapper, i386_init.c's\n"
-    "  kernel_mach_header_is_in_fileset() check sees a non-fileset kernel\n"
-    "  and skips kernel_collection_slide() entirely (the \"kcgen-style KC\"\n"
-    "  path), sidestepping its address-computation bug for this synthetic\n"
-    "  __KCHDR layout (see fileset.c's kchdr_vmaddr comment).\n",
+    "       [-prefix /System/Library/Extensions] [-kext-vmbase <hex>] [-classic]\n",
     prog);
 }
 
@@ -225,20 +213,23 @@ int main(int argc, char *argv[]) {
       vmcursor = kvm_end;
     }
   } else {
+    // Fileset: place kexts above the kernel image (x86-style), keeping the
+    // lowest vmaddr at __TEXT so boot_args->virtBase == VM_KERNEL_LINK_ADDRESS
+    // and vm_kernel_slide stays 0.
     vmcursor = kvm_end;
   }
   fprintf(stderr, "kext placement start: 0x%llx\n", (unsigned long long)vmcursor);
 
+  // Fileset mode: each pool's cursor starts at its own KC placeholder's
+  // address (right after __LAST/__LASTDATA_CONST/kernel __DATA per the
+  // segment_order reorder), so kext content grows the real __TEXT_EXEC/
+  // __DATA_CONST/__DATA segments in place instead of a separate blob.
   KcPlacement placement;
   int use_placement = !classic;
   if (use_placement) {
-    uint64_t last_va = 0, last_sz = 0, lastdc_va = 0, lastdc_sz = 0, plkdata_va = 0;
-    macho_find_segment(kernel_data, kernel_size, "__LAST", &last_va, &last_sz);
-    macho_find_segment(kernel_data, kernel_size, "__LASTDATA_CONST", &lastdc_va, &lastdc_sz);
-    macho_find_segment(kernel_data, kernel_size, "__PRELINK_DATA", &plkdata_va, NULL);
-    placement.text_exec_cursor = last_va + last_sz;
-    placement.data_const_cursor = lastdc_va + lastdc_sz;
-    placement.data_cursor = plkdata_va;
+    macho_find_segment(kernel_data, kernel_size, "__PLK_DATA_CONST", &placement.data_const_cursor, NULL);
+    macho_find_segment(kernel_data, kernel_size, "__PLK_TEXT_EXEC", &placement.text_exec_cursor, NULL);
+    macho_find_segment(kernel_data, kernel_size, "__PRELINK_DATA", &placement.data_cursor, NULL);
     fprintf(stderr, "kc placement: text_exec=0x%llx data_const=0x%llx data=0x%llx\n",
             (unsigned long long)placement.text_exec_cursor,
             (unsigned long long)placement.data_const_cursor,

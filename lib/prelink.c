@@ -425,8 +425,19 @@ int prelink_assemble_merged(const uint8_t *kernel_data, size_t kernel_size,
 
   buf_append(&out, &out_len, &out_cap, kernel_data, kernel_size);
 
+  // __PLK_DATA_CONST/__PLK_TEXT_EXEC/__PRELINK_DATA all start out coincident
+  // (same vmaddr, same fileoff) as empty placeholders reserved by the
+  // kernel's own link step. As each pool's content is inserted, later pools
+  // must be placed both after it in the file *and* above it in VM space -
+  // otherwise their vmaddr collides with content that's actually at a
+  // different file location. kc_builder.c's placement pass computes the
+  // exact same cumulative layout ahead of linking so kext relocations agree
+  // with what ends up here.
+  uint64_t plk_vm_cursor = 0;
+  int have_plk_base = 0;
+
   for (int pool = 0; pool < 3; pool++) {
-    const char *name = pool == 0 ? "__DATA_CONST" : pool == 1 ? "__TEXT_EXEC" : "__DATA";
+    const char *name = pool == 0 ? "__PLK_DATA_CONST" : pool == 1 ? "__PLK_TEXT_EXEC" : "__PRELINK_DATA";
     struct segment_command_64 *sc = NULL;
     uint8_t *lcp2 = out + sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < mh->ncmds; i++) {
@@ -438,6 +449,9 @@ int prelink_assemble_merged(const uint8_t *kernel_data, size_t kernel_size,
       lcp2 += csz;
     }
     if (!sc || pool_len[pool] == 0) continue;
+
+    if (!have_plk_base) { plk_vm_cursor = sc->vmaddr; have_plk_base = 1; }
+    sc->vmaddr = plk_vm_cursor;
 
     size_t insert_at = sc->fileoff + sc->filesize;
     size_t tail_len = out_len - insert_at;
@@ -452,6 +466,7 @@ int prelink_assemble_merged(const uint8_t *kernel_data, size_t kernel_size,
 
     sc->filesize += pool_len[pool];
     sc->vmsize = sc->filesize > sc->vmsize ? sc->filesize : sc->vmsize;
+    plk_vm_cursor += ALIGN_UP(sc->vmsize, PAGE);
 
     int64_t this_shift = (int64_t)pool_len[pool];
     uint8_t *lcp3 = out + sizeof(struct mach_header_64);
@@ -459,7 +474,7 @@ int prelink_assemble_merged(const uint8_t *kernel_data, size_t kernel_size,
       uint32_t cmd = *(uint32_t *)lcp3, csz = *(uint32_t *)(lcp3 + 4);
       if (cmd == LC_SEGMENT_64) {
         struct segment_command_64 *s = (struct segment_command_64 *)lcp3;
-        if (s != sc && s->filesize > 0 && s->fileoff >= insert_at)
+        if (s != sc && s->fileoff >= insert_at)
           s->fileoff += this_shift;
       } else if (cmd == LC_SYMTAB) {
         struct symtab_command *st = (struct symtab_command *)lcp3;
@@ -598,5 +613,144 @@ int prelink_assemble_merged(const uint8_t *kernel_data, size_t kernel_size,
 
   *out_data = final_out;
   *out_size = final_size;
+  return 0;
+}
+
+// Real-KC assembler: grows __TEXT_EXEC/__DATA_CONST/__DATA (the actual
+// segments) in place to hold kext content, anchored at the position of the
+// matching __PLK_TEXT_EXEC/__PLK_DATA_CONST/__PRELINK_DATA placeholder
+// (which stays a zero-size marker forever, per arm_vm_init.c's asserts).
+// No __PRELINK_TEXT/__PRELINK_INFO content is written; those placeholders
+// stay untouched too.
+int prelink_assemble_kc(const uint8_t *kernel_data, size_t kernel_size,
+                        LinkedKext *kexts, size_t num_kexts,
+                        uint8_t **out_data, size_t *out_size,
+                        size_t *out_header_foffs)
+{
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)kernel_data;
+  if (mh->magic != MH_MAGIC_64) {
+    fprintf(stderr, "prelink_kc: kernel is not MH_MAGIC_64 (got 0x%x)\n", mh->magic);
+    return -1;
+  }
+
+  uint8_t *pool_buf[3] = { NULL, NULL, NULL };
+  size_t pool_len[3] = { 0, 0, 0 };
+  size_t pool_cap[3] = { 0, 0, 0 };
+  size_t *header_pool_off = calloc(num_kexts, sizeof(size_t));
+  int *header_pool = calloc(num_kexts, sizeof(int));
+  for (size_t i = 0; i < num_kexts; i++) header_pool[i] = -1;
+
+  for (int pool = 0; pool < 3; pool++) {
+    for (size_t i = 0; i < num_kexts; i++) {
+      if (kexts[i].codeless || !kexts[i].linked_data) continue;
+      const uint8_t *kdata = kexts[i].linked_data;
+      const struct mach_header_64 *kmh = (const struct mach_header_64 *)kdata;
+      const uint8_t *klcp = kdata + sizeof(*kmh);
+      for (uint32_t j = 0; j < kmh->ncmds; j++) {
+        const struct load_command *lc = (const struct load_command *)klcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+          const struct segment_command_64 *sc = (const struct segment_command_64 *)klcp;
+          int is_data_const = segname_is(sc->segname, "__DATA_CONST");
+          int is_text = segname_is(sc->segname, "__TEXT");
+          int matches = (pool == 0 && is_data_const) ||
+                        (pool == 1 && is_text) ||
+                        (pool == 2 && !is_data_const && !is_text);
+          if (matches) {
+            if (sc->fileoff == 0 && header_pool[i] == -1) {
+              header_pool_off[i] = pool_len[pool];
+              header_pool[i] = pool;
+            }
+            buf_append(&pool_buf[pool], &pool_len[pool], &pool_cap[pool],
+                      kdata + sc->fileoff, sc->filesize);
+            uint64_t padded = ALIGN_UP(sc->vmsize ? sc->vmsize : 1, PAGE);
+            if (padded > sc->filesize)
+              buf_append(&pool_buf[pool], &pool_len[pool], &pool_cap[pool],
+                        NULL, padded - sc->filesize);
+          }
+        }
+        klcp += lc->cmdsize;
+      }
+    }
+    pool_len[pool] = ALIGN_UP(pool_len[pool], PAGE);
+  }
+
+  uint8_t *out = NULL;
+  size_t out_len = 0, out_cap = 0;
+  buf_append(&out, &out_len, &out_cap, kernel_data, kernel_size);
+
+  size_t pool_file_start[3] = { 0, 0, 0 };
+  static const char *anchor_name[3] = { "__PLK_DATA_CONST", "__PLK_TEXT_EXEC", "__PRELINK_DATA" };
+  static const char *target_name[3] = { "__DATA_CONST", "__TEXT_EXEC", "__DATA" };
+
+  for (int pool = 0; pool < 3; pool++) {
+    struct segment_command_64 *anchor = NULL, *target = NULL;
+    uint8_t *lcp2 = out + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+      uint32_t cmd = *(uint32_t *)lcp2, csz = *(uint32_t *)(lcp2 + 4);
+      if (cmd == LC_SEGMENT_64) {
+        struct segment_command_64 *s = (struct segment_command_64 *)lcp2;
+        if (segname_is(s->segname, anchor_name[pool])) anchor = s;
+        else if (segname_is(s->segname, target_name[pool])) target = s;
+      }
+      lcp2 += csz;
+    }
+    if (!anchor || !target) continue;
+
+    uint64_t anchor_vmaddr = anchor->vmaddr;
+    size_t insert_at = anchor->fileoff + anchor->filesize;
+
+    if (pool_len[pool] > 0) {
+      size_t tail_len = out_len - insert_at;
+      uint8_t *tail = malloc(tail_len);
+      memcpy(tail, out + insert_at, tail_len);
+
+      pool_file_start[pool] = insert_at;
+      out_len = insert_at;
+      buf_append(&out, &out_len, &out_cap, pool_buf[pool], pool_len[pool]);
+      buf_append(&out, &out_len, &out_cap, tail, tail_len);
+      free(tail);
+
+      target->filesize += pool_len[pool];
+
+      int64_t this_shift = (int64_t)pool_len[pool];
+      uint8_t *lcp3 = out + sizeof(struct mach_header_64);
+      for (uint32_t i = 0; i < mh->ncmds; i++) {
+        uint32_t cmd = *(uint32_t *)lcp3, csz = *(uint32_t *)(lcp3 + 4);
+        if (cmd == LC_SEGMENT_64) {
+          struct segment_command_64 *s = (struct segment_command_64 *)lcp3;
+          if (s->fileoff >= insert_at && s != target)
+            s->fileoff += this_shift;
+        } else if (cmd == LC_SYMTAB) {
+          struct symtab_command *st = (struct symtab_command *)lcp3;
+          if (st->symoff >= insert_at) st->symoff += (uint32_t)this_shift;
+          if (st->stroff >= insert_at) st->stroff += (uint32_t)this_shift;
+        }
+        lcp3 += csz;
+      }
+    }
+
+    // Ensure target reaches at least through the anchor's (pre-shift)
+    // position plus any inserted content, even if pool_len == 0 (still
+    // swallows the gap up to __LASTDATA_CONST/kernel __DATA's end).
+    uint64_t required_end = anchor_vmaddr + pool_len[pool];
+    if (required_end > target->vmaddr + target->vmsize)
+      target->vmsize = required_end - target->vmaddr;
+  }
+
+  for (size_t i = 0; i < num_kexts; i++) {
+    out_header_foffs[i] = (header_pool[i] >= 0)
+        ? pool_file_start[header_pool[i]] + header_pool_off[i] : 0;
+  }
+  free(header_pool_off);
+  free(header_pool);
+  free(pool_buf[0]); free(pool_buf[1]); free(pool_buf[2]);
+
+  // Leave trailing slack after __LINKEDIT's content for fileset_assemble to
+  // append the chained-fixups blob without growing the file further.
+  size_t padded_len = ALIGN_UP(out_len + PAGE, PAGE);
+  buf_append(&out, &out_len, &out_cap, NULL, padded_len - out_len);
+
+  *out_data = out;
+  *out_size = out_len;
   return 0;
 }

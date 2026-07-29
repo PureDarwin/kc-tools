@@ -206,6 +206,31 @@ uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size) {
   return highest;
 }
 
+uint64_t macho_exec_vm_end(const uint8_t *data, size_t size) {
+  size_t sl;
+  const uint8_t *s = find_slice(data, size, &sl);
+  if (!s)
+    return 0;
+
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)s;
+  const uint8_t *lc = s + sizeof(*mh);
+  uint64_t highest = 0;
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    uint32_t cmd = r32(lc), sz = r32(lc + 4);
+    if (cmd == LC_SEGMENT_64) {
+      const struct segment_command_64 *sc =
+          (const struct segment_command_64 *)lc;
+      if ((sc->initprot & VM_PROT_EXECUTE) != 0 && sc->vmsize > 0) {
+        uint64_t end = sc->vmaddr + sc->vmsize;
+        if (end > highest)
+          highest = end;
+      }
+    }
+    lc += sz;
+  }
+  return highest;
+}
+
 int symtab_merge_from_linked(SymTable *st, const LinkedKext *lk) {
   if (!st ||
     !lk ||

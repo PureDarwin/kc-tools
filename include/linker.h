@@ -37,6 +37,7 @@ uint64_t symtab_lookup(const SymTable *st, const char *name);
 
 // Compute the highest VM address across all non-zero segments in a kernel Mach-O.
 uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size);
+uint64_t macho_exec_vm_end(const uint8_t *data, size_t size);
 
 int link_kext(const uint8_t *kext_data, size_t kext_size,
               const SymTable *combined_syms, uint64_t load_vmaddr,

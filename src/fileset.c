@@ -437,7 +437,8 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
       data_const->vmsize = last_end - data_const->vmaddr;
       uint64_t file_end = last_data_const->fileoff + last_data_const->filesize;
       uint64_t data_file_end = data_const->fileoff + data_const->filesize;
-      if (file_end > data_file_end)
+      if (file_end > data_file_end &&
+          file_end - data_const->fileoff <= data_const->vmsize)
         data_const->filesize = file_end - data_const->fileoff;
     }
   }
@@ -786,6 +787,10 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           }
           sc->filesize = 0;
           sc->vmsize = 0;
+          for (uint32_t s = 0; s < sc->nsects; s++) {
+            sects[s].size = 0;
+            sects[s].offset = 0;
+          }
           if (data_end_vmaddr)
             sc->vmaddr = data_end_vmaddr;
         } else if (!memcmp(sc->segname, "__PRELINK_TEXT", 14) ||
@@ -801,6 +806,10 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                   (sects[s].offset - sc->fileoff);
           sc->filesize = 0;
           sc->vmsize = 0;
+          for (uint32_t s = 0; s < sc->nsects; s++) {
+            sects[s].size = 0;
+            sects[s].offset = 0;
+          }
           sc->vmaddr = mapped_vmaddr;
         }
       }

@@ -348,6 +348,14 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   }
 
   const struct mach_header_64 *mh = (const struct mach_header_64 *)base_data;
+  /* The collection-layout rewrites below (republishing the prelink payload as
+   * __TEXT_EXEC/__KEXT_DATA, zeroing the prelink commands, merging
+   * __LASTDATA_CONST into __DATA_CONST, extending __LINKEDIT over the prelink
+   * XML) all exist to satisfy arm_vm_init. i386_init has no equivalent
+   * requirements and XNU's x86 path still reads the payload out of the
+   * original prelink segments, so they must not be applied there. */
+  const int kc_is_arm64 =
+      (mh->magic == MH_MAGIC_64 && mh->cputype == CPU_TYPE_ARM64);
   if (mh->magic != MH_MAGIC_64) {
     fprintf(stderr, "fileset: kernel not MH_MAGIC_64 (0x%x)\n", mh->magic);
     if (base_owned)
@@ -503,7 +511,14 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   /* XNU's kernel entry expects the three PRELINK commands to exist, but
    * arm_vm_init requires them to describe an empty kernel-side prelink area.
    * Keep those original commands as zero-sized placeholders and append
-   * copies under KC-private names for the collection payload. */
+   * copies under KC-private names for the collection payload.
+   *
+   * This is an arm64-only requirement. i386_init has no equivalent rule: on
+   * x86 XNU still expects the payload to live in __PRELINK_TEXT/__PRELINK_INFO
+   * at their real sizes, and OSKext::start() resolves a kext's start function
+   * through them. Republishing the payload as __TEXT_EXEC/__KEXT_DATA and
+   * zeroing the prelink commands there makes every kext fail to start with
+   * "memory region containing module start function is not executable". */
   struct {
     uint8_t *data;
     uint32_t size;
@@ -518,7 +533,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   const char *payload_names[2] = {
     "__DATA", "__TEXT_EXEC"
   };
-  for (size_t i = 0; i < 2; i++) {
+  for (size_t i = 0; kc_is_arm64 && i < 2; i++) {
     if (!payload_sources[i]) continue;
     payload_segs[payload_seg_count].size = payload_sources[i]->cmdsize;
     payload_segs[payload_seg_count].data = malloc(payload_sources[i]->cmdsize);
@@ -538,7 +553,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
    * file range. The aggregate KC text command must not own the kext data
    * pages, so publish those original non-executable segments separately with
    * the same file-to-VM delta. */
-  for (size_t j = 0; j < num_kexts; j++) {
+  for (size_t j = 0; kc_is_arm64 && j < num_kexts; j++) {
     if (kexts[j].codeless || !kexts[j].linked_data ||
         kexts[j].linked_size < sizeof(struct mach_header_64))
       continue;
@@ -777,7 +792,9 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           sc->filesize = 0;
           sc->vmsize = 0;
         }
-        if (!memcmp(sc->segname, "__PRELINK_DATA", 14)) {
+        /* Zeroing the prelink commands is part of the same arm64-only
+         * republish: on x86 the payload stays in them (see kc_is_arm64). */
+        if (kc_is_arm64 && !memcmp(sc->segname, "__PRELINK_DATA", 14)) {
           uint64_t original_vmaddr = sc->vmaddr;
           struct section_64 *sects = (struct section_64 *)(sc + 1);
           for (uint32_t s = 0; s < sc->nsects; s++) {
@@ -787,14 +804,11 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           }
           sc->filesize = 0;
           sc->vmsize = 0;
-          for (uint32_t s = 0; s < sc->nsects; s++) {
-            sects[s].size = 0;
-            sects[s].offset = 0;
-          }
           if (data_end_vmaddr)
             sc->vmaddr = data_end_vmaddr;
-        } else if (!memcmp(sc->segname, "__PRELINK_TEXT", 14) ||
-                   !memcmp(sc->segname, "__PRELINK_INFO", 14)) {
+        } else if (kc_is_arm64 &&
+                   (!memcmp(sc->segname, "__PRELINK_TEXT", 14) ||
+                    !memcmp(sc->segname, "__PRELINK_INFO", 14))) {
           struct section_64 *sects = (struct section_64 *)(sc + 1);
           uint64_t mapped_vmaddr = sc->vmaddr;
           if (!memcmp(sc->segname, "__PRELINK_INFO", 14) &&
@@ -806,10 +820,6 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                   (sects[s].offset - sc->fileoff);
           sc->filesize = 0;
           sc->vmsize = 0;
-          for (uint32_t s = 0; s < sc->nsects; s++) {
-            sects[s].size = 0;
-            sects[s].offset = 0;
-          }
           sc->vmaddr = mapped_vmaddr;
         }
       }

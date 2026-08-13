@@ -6,6 +6,9 @@
 #include <stdio.h>
 
 #define PAGE 0x1000ULL
+/* arm64 XNU is built for a 16KB page granule; segment vmaddrs it maps or frees
+ * must respect that, not the 4KB PAGE used for file layout above. */
+#define ARM64_KERNEL_PAGE 0x4000ULL
 #define ALIGN_UP(x, a) (((uint64_t)(x) + ((uint64_t)(a) - 1)) & ~((uint64_t)(a) - 1))
 
 #define DYLD_CHAINED_PTR_64_KERNEL_CACHE 8
@@ -820,7 +823,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                   (sects[s].offset - sc->fileoff);
           sc->filesize = 0;
           sc->vmsize = 0;
-          sc->vmaddr = mapped_vmaddr;
+          sc->vmaddr = mapped_vmaddr & ~(ARM64_KERNEL_PAGE - 1);
         }
       }
       lcp += lc->cmdsize;

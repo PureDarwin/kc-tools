@@ -1,4 +1,5 @@
 #include "prelink.h"
+#include "macho_view.h"
 #include "plist.h"
 #include "macho_fmt.h"
 #include <stdlib.h>
@@ -20,9 +21,9 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
                      LinkedKext *kexts, size_t num_kexts,
                      uint8_t **out_data, size_t *out_size)
 {
-  const struct mach_header_64 *mh = (const struct mach_header_64 *)kernel_data;
-  if (mh->magic != MH_MAGIC_64) {
-    fprintf(stderr, "prelink: kernel is not MH_MAGIC_64 (got 0x%x)\n", mh->magic);
+  MachoView mv;
+  if (macho_view(kernel_data, kernel_size, &mv) != 0) {
+    fprintf(stderr, "prelink: kernel is not a Mach-O\n");
     return -1;
   }
 
@@ -30,11 +31,12 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   // Skip zero-size placeholder __PRELINK_TEXT (vmsize=0) segments.
   uint64_t kernel_vm_end = 0;
   {
-    const uint8_t *lcp = kernel_data + sizeof(*mh);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
+    const uint8_t *lcp = kernel_data + mv.hdrsize;
+    for (uint32_t i = 0; i < mv.ncmds; i++) {
       const struct load_command *lc = (const struct load_command *)lcp;
-      if (lc->cmd == LC_SEGMENT_64) {
-        const struct segment_command_64 *sc = (const struct segment_command_64 *)lcp;
+      if (macho_is_segment(&mv, lcp)) {
+        MachoSeg segv; macho_seg_get(&mv, lcp, &segv);
+        const MachoSeg *sc = &segv;
         if (sc->vmsize > 0) {
           uint64_t end = sc->vmaddr + sc->vmsize;
           if (end > kernel_vm_end) kernel_vm_end = end;
@@ -53,7 +55,9 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   uint64_t kext_end = prelink_text_vmaddr;
   for (size_t i = 0; i < num_kexts; i++) {
     if (kexts[i].codeless) continue;   // no code to place
-    uint64_t end = kexts[i].load_vmaddr + ALIGN_UP(kexts[i].linked_size, PAGE);
+    uint64_t occupied = kexts[i].vm_extent ? kexts[i].vm_extent
+                                           : kexts[i].linked_size;
+    uint64_t end = kexts[i].load_vmaddr + ALIGN_UP(occupied, PAGE);
     if (end > kext_end) kext_end = end;
     fprintf(stderr, "  kext[%zu] %s: vmaddr=0x%llx size=0x%zx kmod_info=0x%llx\n",
             i, kexts[i].bundle_id,
@@ -109,22 +113,22 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
 
   // Find existing zero-size __PRELINK_TEXT, __PRELINK_DATA, __PRELINK_INFO
   // placeholders to patch in-place. If not found we append new load commands.
-  struct segment_command_64 *existing_pt = NULL;  // __PRELINK_TEXT
-  struct segment_command_64 *existing_pd = NULL;  // __PRELINK_DATA
-  struct segment_command_64 *existing_pi = NULL;  // __PRELINK_INFO
+  uint8_t *existing_pt = NULL;  // __PRELINK_TEXT
+  uint8_t *existing_pd = NULL;  // __PRELINK_DATA
+  uint8_t *existing_pi = NULL;  // __PRELINK_INFO
   {
     // Use a mutable copy (will be the output buf), but scan original for now.
-    const uint8_t *lcp = kernel_data + sizeof(*mh);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
+    const uint8_t *lcp = kernel_data + mv.hdrsize;
+    for (uint32_t i = 0; i < mv.ncmds; i++) {
       const struct load_command *lc = (const struct load_command *)lcp;
-      if (lc->cmd == LC_SEGMENT_64) {
-        const struct segment_command_64 *sc = (const struct segment_command_64 *)lcp;
-        if (!memcmp(sc->segname, "__PRELINK_TEXT", 14) && sc->vmsize == 0)
-          existing_pt = (struct segment_command_64 *)lcp;
-        if (!memcmp(sc->segname, "__PRELINK_DATA", 14) && sc->vmsize == 0)
-          existing_pd = (struct segment_command_64 *)lcp;
-        if (!memcmp(sc->segname, "__PRELINK_INFO", 14) && sc->vmsize == 0)
-          existing_pi = (struct segment_command_64 *)lcp;
+      if (macho_is_segment(&mv, lcp)) {
+        MachoSeg segv; macho_seg_get(&mv, lcp, &segv);
+        if (!memcmp(segv.segname, "__PRELINK_TEXT", 14) && segv.vmsize == 0)
+          existing_pt = (uint8_t *)lcp;
+        if (!memcmp(segv.segname, "__PRELINK_DATA", 14) && segv.vmsize == 0)
+          existing_pd = (uint8_t *)lcp;
+        if (!memcmp(segv.segname, "__PRELINK_INFO", 14) && segv.vmsize == 0)
+          existing_pi = (uint8_t *)lcp;
       }
       lcp += lc->cmdsize;
     }
@@ -133,22 +137,22 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   // How many new LCs do we need to append?
   size_t extra_lc = 0;
   if (!existing_pt)
-    extra_lc += sizeof(struct segment_command_64) + sizeof(struct section_64);
+    extra_lc += macho_seg1_cmdsize(&mv);
   if (!existing_pd)
-    extra_lc += sizeof(struct segment_command_64) + sizeof(struct section_64);
+    extra_lc += macho_seg1_cmdsize(&mv);
   if (!existing_pi)
-    extra_lc += sizeof(struct segment_command_64) + sizeof(struct section_64);
+    extra_lc += macho_seg1_cmdsize(&mv);
 
   // Find where kernel segment data starts (first non-zero fileoff).
   uint64_t kernel_body_off = 0;
   {
-    const uint8_t *lcp = kernel_data + sizeof(*mh);
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
+    const uint8_t *lcp = kernel_data + mv.hdrsize;
+    for (uint32_t i = 0; i < mv.ncmds; i++) {
       const struct load_command *lc = (const struct load_command *)lcp;
-      if (lc->cmd == LC_SEGMENT_64) {
-        const struct segment_command_64 *sc = (const struct segment_command_64 *)lcp;
-        if (sc->filesize > 0 && (!kernel_body_off || sc->fileoff < kernel_body_off))
-          kernel_body_off = sc->fileoff;
+      if (macho_is_segment(&mv, lcp)) {
+        MachoSeg segv; macho_seg_get(&mv, lcp, &segv);
+        if (segv.filesize > 0 && (!kernel_body_off || segv.fileoff < kernel_body_off))
+          kernel_body_off = segv.fileoff;
       }
       lcp += lc->cmdsize;
     }
@@ -157,7 +161,7 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
     kernel_body_off = PAGE;
 
   if (extra_lc > 0) {
-    size_t cur_hdr_end = sizeof(*mh) + mh->sizeofcmds;
+    size_t cur_hdr_end = mv.hdrsize + mv.sizeofcmds;
     if (cur_hdr_end + extra_lc > kernel_body_off) {
       fprintf(stderr, "prelink: no room for %zu bytes of new LCs "
               "(header ends at 0x%zx, body at 0x%llx)\n",
@@ -180,26 +184,28 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
       continue;
     memcpy(out + kext_file_base, k->linked_data, k->linked_size);
 
-    struct mach_header_64 *kmh = (struct mach_header_64 *)(out + kext_file_base);
-    if (kmh->magic != MH_MAGIC_64)
+    uint8_t *kmh = out + kext_file_base;
+    MachoView kv;
+    if (macho_view(kmh, k->linked_size, &kv) != 0 || kv.base != kmh)
       continue;
 
     // Fix filetype: MH_BUNDLE -> MH_KEXT_BUNDLE.
-    if (kmh->filetype == MH_BUNDLE)
-      kmh->filetype = MH_KEXT_BUNDLE;
+    if (macho_hdr_filetype(&kv, kmh) == MH_BUNDLE)
+      macho_hdr_set_filetype(&kv, kmh, MH_KEXT_BUNDLE);
 
     // Clear flags that are invalid for kexts: MH_TWOLEVEL (0x4),
     // MH_NOFIXPREBINDING (0x80). Leave MH_NOUNDEFS (0x1).
-    kmh->flags &= ~(0x4u | 0x80u);
+    macho_hdr_set_flags(&kv, kmh, macho_hdr_flags(&kv, kmh) & ~(0x4u | 0x80u));
 
     // Strip load commands that are dyld-specific and invalid in MH_KEXT_BUNDLE.
     // IDA validates that kexts don't have these. Compact the LC area in-place.
     {
-      uint8_t *lc_base  = (uint8_t *)(kmh + 1);
+      uint8_t *lc_base  = kmh + kv.hdrsize;
       uint8_t *lc_read  = lc_base;
       uint8_t *lc_write = lc_base;
       uint32_t new_ncmds = 0, new_szcmds = 0;
-      for (uint32_t ci = 0; ci < kmh->ncmds; ci++) {
+      uint32_t kncmds = macho_hdr_ncmds(&kv, kmh);
+      for (uint32_t ci = 0; ci < kncmds; ci++) {
         uint32_t cmd = *(uint32_t *)lc_read;
         uint32_t csz = *(uint32_t *)(lc_read + 4);
         int drop = (cmd == 0x22 || cmd == 0x80000022 || // LC_DYLD_INFO(_ONLY)
@@ -220,8 +226,7 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
       // Zero the vacated space.
       if (lc_write < lc_read)
         memset(lc_write, 0, (size_t)(lc_read - lc_write));
-      kmh->ncmds = new_ncmds;
-      kmh->sizeofcmds = new_szcmds;
+      macho_hdr_set_cmds(&kv, kmh, new_ncmds, new_szcmds);
     }
   }
 
@@ -232,107 +237,59 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   // Pointer fixup: existing_pt/pd/pi point into kernel_data; rebase to out.
   ptrdiff_t rebase = (ptrdiff_t)(out - kernel_data);
   if (existing_pt)
-    existing_pt = (struct segment_command_64 *)((uint8_t *)existing_pt + rebase);
+    existing_pt += rebase;
   if (existing_pd)
-    existing_pd = (struct segment_command_64 *)((uint8_t *)existing_pd + rebase);
+    existing_pd += rebase;
   if (existing_pi)
-    existing_pi = (struct segment_command_64 *)((uint8_t *)existing_pi + rebase);
+    existing_pi += rebase;
 
-  struct mach_header_64 *new_mh = (struct mach_header_64 *)out;
-  uint8_t *lc_end = out + sizeof(*new_mh) + new_mh->sizeofcmds;
+  uint8_t *new_mh = out;
+  uint32_t new_ncmds = macho_hdr_ncmds(&mv, new_mh);
+  uint32_t new_szcmds = macho_hdr_sizeofcmds(&mv, new_mh);
+  uint8_t *lc_end = out + mv.hdrsize + new_szcmds;
 
-  // Helper to fill a segment + one section.
-  #define FILL_SEG(sc, sname, vm, vsz, foff, fsz, mp, ip, stype) do { \
-    memset(sc, 0, sizeof(*(sc)) + sizeof(struct section_64)); \
-    (sc)->cmd      = LC_SEGMENT_64; \
-    (sc)->cmdsize  = sizeof(*(sc)) + sizeof(struct section_64); \
-    memcpy((sc)->segname, sname, strlen(sname)); \
-    (sc)->vmaddr   = (vm); \
-    (sc)->vmsize   = (vsz); \
-    (sc)->fileoff  = (foff); \
-    (sc)->filesize = (fsz); \
-    (sc)->maxprot  = (mp); \
-    (sc)->initprot = (ip); \
-    (sc)->nsects   = 1; \
-  } while (0)
-
-  #define FILL_SECT(sect, stn, sgn, a, sz, off, aln) do { \
-    memcpy((sect)->sectname, stn, strlen(stn)); \
-    memcpy((sect)->segname,  sgn, strlen(sgn)); \
-    (sect)->addr   = (a); \
-    (sect)->size   = (sz); \
-    (sect)->offset = (uint32_t)(off); \
-    (sect)->align  = (aln); \
-  } while (0)
+  // Emit (or patch in place) a segment + its single section, in the kernel's
+  // Mach-O width.
+  #define PUT_SEG(slot, sname, stn, vm, vsz, foff, fsz, mp, ip, saddr, ssz, soff, aln) \
+    do { \
+      if (slot) { \
+        macho_emit_seg1(&mv, (slot), sname, (vm), (vsz), (foff), (fsz), (mp), (ip), \
+                        stn, (saddr), (ssz), (uint32_t)(soff), (aln)); \
+      } else { \
+        uint32_t csz = macho_emit_seg1(&mv, lc_end, sname, (vm), (vsz), (foff), (fsz), \
+                                       (mp), (ip), stn, (saddr), (ssz), \
+                                       (uint32_t)(soff), (aln)); \
+        lc_end += csz; \
+        new_ncmds++; \
+        new_szcmds += csz; \
+      } \
+    } while (0)
 
   // __PRELINK_TEXT
-  if (existing_pt) {
-    FILL_SEG(existing_pt, "__PRELINK_TEXT",
-             prelink_text_vmaddr, prelink_text_vmsize,
-             prelink_text_fileoff, prelink_text_vmsize,
-             VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 0);
-    struct section_64 *sect = (struct section_64 *)(existing_pt + 1);
-    FILL_SECT(sect, "__text", "__PRELINK_TEXT",
-              prelink_text_vmaddr, prelink_text_vmsize, prelink_text_fileoff, 12);
-  } else {
-    struct segment_command_64 *sc = (struct segment_command_64 *)lc_end;
-    FILL_SEG(sc, "__PRELINK_TEXT",
-             prelink_text_vmaddr, prelink_text_vmsize,
-             prelink_text_fileoff, prelink_text_vmsize,
-             VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 0);
-    struct section_64 *sect = (struct section_64 *)(sc + 1);
-    FILL_SECT(sect, "__text", "__PRELINK_TEXT",
-              prelink_text_vmaddr, prelink_text_vmsize, prelink_text_fileoff, 12);
-    lc_end += sc->cmdsize;
-    new_mh->ncmds++;
-    new_mh->sizeofcmds += sc->cmdsize;
-  }
+  PUT_SEG(existing_pt, "__PRELINK_TEXT", "__text",
+          prelink_text_vmaddr, prelink_text_vmsize,
+          prelink_text_fileoff, prelink_text_vmsize,
+          VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE,
+          prelink_text_vmaddr, prelink_text_vmsize, prelink_text_fileoff, 12);
 
   // __PRELINK_DATA (empty placeholder between __PRELINK_TEXT and __PRELINK_INFO)
   uint64_t pd_vmaddr = prelink_info_vmaddr - PAGE;
-  if (existing_pd) {
-    FILL_SEG(existing_pd, "__PRELINK_DATA",
-             pd_vmaddr, PAGE, 0, 0,
-             VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 0);
-    struct section_64 *sect = (struct section_64 *)(existing_pd + 1);
-    FILL_SECT(sect, "__data", "__PRELINK_DATA", pd_vmaddr, 0, 0, 0);
-  } else {
-    struct segment_command_64 *sc = (struct segment_command_64 *)lc_end;
-    FILL_SEG(sc, "__PRELINK_DATA",
-             pd_vmaddr, PAGE, 0, 0,
-             VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 0);
-    struct section_64 *sect = (struct section_64 *)(sc + 1);
-    FILL_SECT(sect, "__data", "__PRELINK_DATA", pd_vmaddr, 0, 0, 0);
-    lc_end += sc->cmdsize;
-    new_mh->ncmds++;
-    new_mh->sizeofcmds += sc->cmdsize;
-  }
+  PUT_SEG(existing_pd, "__PRELINK_DATA", "__data",
+          pd_vmaddr, PAGE, 0, 0,
+          VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+          pd_vmaddr, 0, 0, 0);
 
   // __PRELINK_INFO
-  if (existing_pi) {
-    FILL_SEG(existing_pi, "__PRELINK_INFO",
-             prelink_info_vmaddr, prelink_info_vmsize,
-             prelink_info_fileoff, info_xml_len + 1,
-             VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 0);
-    struct section_64 *sect = (struct section_64 *)(existing_pi + 1);
-    FILL_SECT(sect, "__info", "__PRELINK_INFO",
-              prelink_info_vmaddr, info_xml_len + 1, prelink_info_fileoff, 0);
-  } else {
-    struct segment_command_64 *sc = (struct segment_command_64 *)lc_end;
-    FILL_SEG(sc, "__PRELINK_INFO",
-             prelink_info_vmaddr, prelink_info_vmsize,
-             prelink_info_fileoff, info_xml_len + 1,
-             VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 0);
-    struct section_64 *sect = (struct section_64 *)(sc + 1);
-    FILL_SECT(sect, "__info", "__PRELINK_INFO",
-              prelink_info_vmaddr, info_xml_len + 1, prelink_info_fileoff, 0);
-    lc_end += sc->cmdsize;
-    new_mh->ncmds++;
-    new_mh->sizeofcmds += sc->cmdsize;
-  }
+  PUT_SEG(existing_pi, "__PRELINK_INFO", "__info",
+          prelink_info_vmaddr, prelink_info_vmsize,
+          prelink_info_fileoff, info_xml_len + 1,
+          VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+          prelink_info_vmaddr, info_xml_len + 1, prelink_info_fileoff, 0);
 
-  #undef FILL_SEG
-  #undef FILL_SECT
+  macho_hdr_set_cmds(&mv, new_mh, new_ncmds, new_szcmds);
+
+  #undef PUT_SEG
+
 
   (void)put64;
 

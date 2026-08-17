@@ -242,7 +242,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Codeless kexts (com.apple.kpi.* KPI pseudo-kexts, ApplePlatformFamily, ...):
-  // Info.plist only, no executable.  They must appear in _PrelinkInfoDictionary
+  // Info.plist only, no executable. They must appear in _PrelinkInfoDictionary
   // so OSKext::resolveDependencies() can satisfy real kexts' OSBundleLibraries
   // (e.g. AppleI386GenericPlatform needs com.apple.kpi.iokit); without them the
   // real kext fails to load on demand and its IOKit personality never matches.

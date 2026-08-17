@@ -8,6 +8,7 @@ set(common_opts -Wall -Wno-unused-function -Wno-unused-variable)
 
 set(shared_lib
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/linker.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/macho_view.c
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/plist.c
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/prelink.c
 )

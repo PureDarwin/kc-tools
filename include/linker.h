@@ -20,6 +20,11 @@ typedef struct {
   uint8_t *linked_data;
   size_t linked_size;
   uint64_t load_vmaddr;
+  // Bytes this kext occupies once mapped, which is not linked_size: a segment
+  // may have vmsize > filesize (__LINKEDIT padding, __bss), so the mapped image
+  // runs past the end of the file image. Spacing kexts by linked_size lets one
+  // kext's last segment overlap the next kext's header. Set by patch_kmod_info.
+  uint64_t vm_extent;
   uint64_t kmod_info_addr;
   char *info_plist_xml;
   size_t info_plist_len;

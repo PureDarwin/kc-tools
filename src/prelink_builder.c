@@ -123,7 +123,8 @@ static int load_kext(const char *kext_dir, const char *prefix, KextBundle *out) 
 static void usage(const char *prog) {
   fprintf(stderr,
     "Usage: %s -kernel <file> -kext <dir.kext> [...] -o <output>\n"
-    "       [-prefix /System/Library/Extensions] [-kext-vmbase <hex>]\n"
+    "       [-codeless <dir.kext>] [-prefix /System/Library/Extensions]\n"
+    "       [-kext-vmbase <hex>]\n"
     "\n"
     "  Builds a prelinked kernel Mach-O from a base kernel and kext bundles.\n"
     "  Links each kext against the kernel symbol table, applies x86_64\n"
@@ -139,6 +140,8 @@ int main(int argc, char *argv[]) {
   const char *prefix = "/System/Library/Extensions";
   const char *kext_paths[MAX_KEXTS];
   int num_kext_paths = 0;
+  const char *codeless_paths[MAX_KEXTS];
+  int num_codeless_paths = 0;
   uint64_t kext_vmbase = 0;
 
   for (int i = 1; i < argc; i++) {
@@ -146,6 +149,8 @@ int main(int argc, char *argv[]) {
       kernel_path = argv[++i];
     } else if (!strcmp(argv[i], "-kext") && i + 1 < argc) {
       if (num_kext_paths < MAX_KEXTS) kext_paths[num_kext_paths++] = argv[++i];
+    } else if (!strcmp(argv[i], "-codeless") && i + 1 < argc) {
+      if (num_codeless_paths < MAX_KEXTS) codeless_paths[num_codeless_paths++] = argv[++i];
     } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
       output_path = argv[++i];
     } else if (!strcmp(argv[i], "-prefix") && i + 1 < argc) {
@@ -158,7 +163,11 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
-  if (!kernel_path || !output_path || num_kext_paths == 0) { usage(argv[0]); return 1; }
+  if (!kernel_path || !output_path ||
+      (num_kext_paths == 0 && num_codeless_paths == 0)) {
+    usage(argv[0]);
+    return 1;
+  }
 
   size_t kernel_size;
   uint8_t *kernel_data = read_file(kernel_path, &kernel_size);
@@ -179,7 +188,7 @@ int main(int argc, char *argv[]) {
       nkexts++;
   }
 
-  if (nkexts == 0) {
+  if (num_kext_paths > 0 && nkexts == 0) {
     fprintf(stderr, "No kexts loaded\n");
     return 1;
   }
@@ -215,13 +224,52 @@ int main(int argc, char *argv[]) {
     }
     patch_kmod_info(lk);
     symtab_merge_from_linked(&ksyms, lk);
-    vmcursor += (lk->linked_size + 0xFFF) & ~(uint64_t)0xFFF;
+    uint64_t occupied = lk->vm_extent ? lk->vm_extent : lk->linked_size;
+    vmcursor += (occupied + 0xFFF) & ~(uint64_t)0xFFF;
     nlinked++;
   }
 
-  if (nlinked == 0) {
+  if (num_kext_paths > 0 && nlinked == 0) {
     fprintf(stderr, "No kexts linked\n");
     return 1;
+  }
+
+  // Codeless kexts (notably the com.apple.kpi.* interface bundles) provide
+  // dependency metadata only. They need an entry in __PRELINK_INFO, but no
+  // executable or linked text.
+  for (int i = 0; i < num_codeless_paths && nlinked < MAX_KEXTS; i++) {
+    char path[700];
+    char *plist_xml = NULL;
+    size_t plist_len = 0;
+
+    snprintf(path, sizeof(path), "%s/Contents/Info.plist", codeless_paths[i]);
+    plist_xml = (char *)read_file(path, &plist_len);
+    if (!plist_xml) {
+      snprintf(path, sizeof(path), "%s/Info.plist", codeless_paths[i]);
+      plist_xml = (char *)read_file(path, &plist_len);
+    }
+    if (!plist_xml) {
+      fprintf(stderr, "codeless: no Info.plist in %s\n", codeless_paths[i]);
+      continue;
+    }
+
+    PlistNode *plist = plist_parse(plist_xml, plist_len);
+    const char *bid = plist ? plist_dict_get_str(plist, "CFBundleIdentifier") : NULL;
+    const char *bver = plist ? plist_dict_get_str(plist, "CFBundleVersion") : NULL;
+
+    LinkedKext *lk = &linked[nlinked];
+    memset(lk, 0, sizeof(*lk));
+    lk->codeless = 1;
+    if (bid) strncpy(lk->bundle_id, bid, sizeof(lk->bundle_id) - 1);
+    if (bver) strncpy(lk->version, bver, sizeof(lk->version) - 1);
+    const char *bname = strrchr(codeless_paths[i], '/');
+    bname = bname ? bname + 1 : codeless_paths[i];
+    snprintf(lk->bundle_path, sizeof(lk->bundle_path), "%s/%s", prefix, bname);
+    lk->info_plist_xml = plist_xml;
+    lk->info_plist_len = plist_len;
+    if (plist) plist_free(plist);
+    fprintf(stderr, "codeless kext: %s v%s\n", lk->bundle_id, lk->version);
+    nlinked++;
   }
 
   uint8_t *out_data = NULL;

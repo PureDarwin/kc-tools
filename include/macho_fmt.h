@@ -17,7 +17,10 @@
 // CPU types
 #define CPU_TYPE_X86_64 ((int)(7 | 0x01000000))
 #define CPU_TYPE_ARM64  ((int)(12 | 0x01000000))
+#define CPU_TYPE_ARM    ((int)12)
 #define CPU_SUBTYPE_ALL 0
+#define CPU_SUBTYPE_ARM_V6  6
+#define CPU_SUBTYPE_ARM_V7  9
 
 // Flags
 #define MH_NOUNDEFS       0x1
@@ -26,6 +29,7 @@
 
 // Load commands
 #define LC_REQ_DYLD           0x80000000u
+#define LC_SEGMENT            0x1
 #define LC_SEGMENT_64         0x19
 #define LC_SYMTAB             0x2
 #define LC_DYSYMTAB           0xb
@@ -47,6 +51,11 @@
 // x86_64 thread state (for LC_UNIXTHREAD entry)
 #define X86_THREAD_STATE64     4
 #define X86_THREAD_STATE64_CNT 42   // uint32 count
+
+// arm (32-bit) thread state (for LC_UNIXTHREAD entry): r0-r12, sp, lr, pc, cpsr
+#define ARM_THREAD_STATE       1
+#define ARM_THREAD_STATE_CNT   17   // uint32 count
+#define ARM_THREAD_STATE_PC    15   // index of pc within the state
 
 // LC_FILESET_ENTRY payload
 struct fileset_entry_command {
@@ -94,6 +103,7 @@ struct dyld_chained_fixups_header {
 #define SECTION_TYPE               0xff
 
 // nlist flags
+#define N_STAB  0xe0    /* mask: any bit set means a debug (stab) entry */
 #define N_UNDF  0x0
 #define N_ABS   0x2
 #define N_SECT  0xe
@@ -107,6 +117,18 @@ struct dyld_chained_fixups_header {
 #define RL_SHORT 1
 #define RL_LONG  2
 #define RL_QUAD  3
+
+// arm (32-bit) relocation types
+#define ARM_RELOC_VANILLA       0
+#define ARM_RELOC_PAIR          1
+#define ARM_RELOC_SECTDIFF      2
+#define ARM_RELOC_LOCAL_SECTDIFF 3
+#define ARM_RELOC_PB_LA_PTR     4
+#define ARM_RELOC_BR24          5
+#define ARM_THUMB_RELOC_BR22    6
+#define ARM_THUMB_32BIT_BRANCH  7
+#define ARM_RELOC_HALF          8
+#define ARM_RELOC_HALF_SECTDIFF 9
 
 // x86_64 relocation types
 #define X86_64_RELOC_UNSIGNED   0
@@ -212,6 +234,54 @@ struct relocation_info {
            r_length    : 2,
            r_extern    : 1,
            r_type      : 4;
+};
+
+// 32-bit Mach-O
+
+struct mach_header {
+  uint32_t magic;
+  int32_t cputype;
+  int32_t cpusubtype;
+  uint32_t filetype;
+  uint32_t ncmds;
+  uint32_t sizeofcmds;
+  uint32_t flags;
+};
+
+struct segment_command {
+  uint32_t cmd;
+  uint32_t cmdsize;
+  char segname[16];
+  uint32_t vmaddr;
+  uint32_t vmsize;
+  uint32_t fileoff;
+  uint32_t filesize;
+  int32_t maxprot;
+  int32_t initprot;
+  uint32_t nsects;
+  uint32_t flags;
+};
+
+struct section {
+  char sectname[16];
+  char segname[16];
+  uint32_t addr;
+  uint32_t size;
+  uint32_t offset;
+  uint32_t align;
+  uint32_t reloff;
+  uint32_t nreloc;
+  uint32_t flags;
+  uint32_t reserved1;
+  uint32_t reserved2;
+};
+
+struct nlist {
+  union { uint32_t n_strx; } n_un;
+  uint8_t n_type;
+  uint8_t n_sect;
+  int16_t n_desc;
+  uint32_t n_value;
 };
 
 struct fat_header {

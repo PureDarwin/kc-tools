@@ -23,10 +23,6 @@ typedef struct {
   uint32_t seg_index;
 } FixupSite;
 
-/* The kernel's original LC_UNIXTHREAD is not authoritative after it has
- * been turned into a collection.  In particular, some XNU builds carry a
- * stale ARM64 entry there.  The loader still uses that command, so recover
- * the real bootstrap entry from the preserved symbol table. */
 static uint64_t
 kernel_arm64_start(const uint8_t *data, size_t data_size,
     const struct mach_header_64 *mh)
@@ -144,7 +140,7 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
       (const struct relocation_info *)(data + dysymtab->locreloff);
   for (uint32_t i = 0; i < dysymtab->nlocrel; i++) {
     const struct relocation_info *r = &relocs[i];
-    /* Only ARM64_RELOC_UNSIGNED is a standalone absolute pointer.  The
+    /* Only ARM64_RELOC_UNSIGNED is a standalone absolute pointer. The
      * other ARM64 relocation kinds participate in instruction/addend pairs
      * and cannot be represented by a single KC rebase slot. */
     if (r->r_extern || r->r_pcrel || r->r_length != RL_QUAD ||
@@ -187,7 +183,7 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
 
   /* One chain per page is always sufficient: any two 8-byte-aligned slots on
    * the same 0x1000 page are at most 0xff8 apart, well within the 12-bit next
-   * field's 0x3ffc reach.  So each segment needs only its per-page start table
+   * field's 0x3ffc reach. So each segment needs only its per-page start table
    * (dyld_chained_starts_in_segment) with no auxiliary chain_starts array. */
   uint32_t starts_size = sizeof(uint32_t) + (uint32_t)nsegs * sizeof(uint32_t);
   uint32_t total_sites = 0;
@@ -241,7 +237,7 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
     for (uint32_t pi = 0; pi < pages; pi++) page_start[pi] = DYLD_CHAINED_PTR_START_NONE;
 
     /* Thread every valid site on a page into a single chain, in ascending
-     * order, and encode each slot's KC-relative target.  page_start records
+     * order, and encode each slot's KC-relative target. page_start records
      * the first member; each non-last member carries the 4-byte-scaled delta
      * to the next in its high next field. */
     uint32_t prev_fileoff = 0;
@@ -255,7 +251,7 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
         continue;
       uint8_t *loc = data + sites[si][j].fileoff;
       uint64_t target = *(uint64_t *)loc;
-      /* A classic local relocation may describe a NULL pointer.  Chained
+      /* A classic local relocation may describe a NULL pointer. Chained
        * fixups have no NULL target encoding: target offset zero is resolved
        * to the KC base, so leaving this slot in a chain silently turns NULL
        * object pointers into valid kernel addresses. */
@@ -603,7 +599,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   }
 
   /* The prelink segment's original vmsize can stop before the final page
-   * occupied by a kext's kmod_info/data.  The fileset entries use the
+   * occupied by a kext's kmod_info/data. The fileset entries use the
    * placement metadata as the authoritative extent, so make the collection
    * payload cover every placed kext page. */
   for (size_t i = 0; i < payload_seg_count; i++) {
@@ -788,7 +784,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           sc->vmsize = text_exec_vmaddr - sc->vmaddr;
         if (!memcmp(sc->segname, "__PLK_DATA_CONST", 16) ||
             !memcmp(sc->segname, "__PLK_TEXT_EXEC", 15)) {
-          /* These commands belong to the embedded kernel.  The collection
+          /* These commands belong to the embedded kernel. The collection
            * payload is represented by the KC-level copies below; leaving a
            * one-page PLK_DATA_CONST here violates XNU's paired-segment
            * invariant before VM initialization can begin. */
@@ -836,7 +832,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   omh->sizeofcmds += new_cmds_size;
 
   /* The embedded kernel's PLK segments are placeholders, not the KC
-   * payload.  Normalize them after appending every load command so no later
+   * payload. Normalize them after appending every load command so no later
    * header rewrite can leave one half of XNU's paired PLK range non-empty. */
   {
     uint8_t *scan = out + sizeof(*omh);

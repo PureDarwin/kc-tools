@@ -119,6 +119,19 @@ struct dyld_info_command {
 #define BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED         0xB0
 #define BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB    0xC0
 
+#ifndef LC_FUNCTION_STARTS
+#define LC_FUNCTION_STARTS 0x26
+#endif
+#ifndef LC_DATA_IN_CODE
+#define LC_DATA_IN_CODE 0x29
+#endif
+#ifndef LC_DYLD_CHAINED_FIXUPS
+#define LC_DYLD_CHAINED_FIXUPS (0x34 | 0x80000000)
+#endif
+#ifndef LC_DYLD_EXPORTS_TRIE
+#define LC_DYLD_EXPORTS_TRIE (0x33 | 0x80000000)
+#endif
+
 typedef struct { uint64_t fileoff; uint64_t vmaddr; uint64_t filesize; } SegInfo;
 
 static void symtab_add(SymTable *st, const char *name, uint64_t addr) {
@@ -361,6 +374,187 @@ void symtab_free(SymTable *st) {
     free(st->syms[i].name);
   free(st->syms);
   memset(st, 0, sizeof(*st));
+}
+
+/* Give the image a file layout matching its VM layout, zero-filling the holes.
+ * ld64 packs the file, so __bss (vmsize > filesize) leaves everything after it
+ * at a lower file offset than its VA, and the KC then reads __bss as
+ * __LINKEDIT's symbol table. */
+static int relayout_va_consistent(uint8_t **bufp, size_t *sizep) {
+  MachoView mv;
+  uint8_t *buf = *bufp;
+
+  if (macho_view(buf, *sizep, &mv) != 0)
+    return -1;
+
+  /* Image bounds, and whether anything is out of step. */
+  uint64_t image_start = UINT64_MAX;
+  uint64_t image_end = 0;
+  bool needs_relayout = false;
+
+  for (MACHO_EACH_LC(&mv, lcc)) {
+    uint8_t *lcp = (uint8_t *)lcc;
+    if (!macho_is_segment(&mv, lcp))
+      continue;
+
+    MachoSeg sg;
+    macho_seg_get(&mv, lcp, &sg);
+    if (sg.vmsize == 0)
+      continue;
+
+    if (sg.vmaddr < image_start)
+      image_start = sg.vmaddr;
+    if (sg.vmaddr + sg.vmsize > image_end)
+      image_end = sg.vmaddr + sg.vmsize;
+    if (sg.filesize > sg.vmsize)
+      return -1;   /* more file than address space: not something to rewrite */
+  }
+
+  if (image_start == UINT64_MAX || image_end <= image_start)
+    return 0;   /* nothing mapped; leave it alone */
+
+  for (MACHO_EACH_LC(&mv, lcc)) {
+    uint8_t *lcp = (uint8_t *)lcc;
+    if (!macho_is_segment(&mv, lcp))
+      continue;
+
+    MachoSeg sg;
+    macho_seg_get(&mv, lcp, &sg);
+    if (sg.vmsize == 0)
+      continue;
+    if (sg.fileoff != sg.vmaddr - image_start) {
+      needs_relayout = true;
+      break;
+    }
+  }
+
+  if (!needs_relayout)
+    return 0;
+
+  size_t new_size = (size_t)(image_end - image_start);
+  uint8_t *nbuf = calloc(1, new_size);
+  if (!nbuf)
+    return -1;
+
+  /* Copy each segment to its VA-derived offset, recording the shift so file
+   * offsets in other load commands can follow. */
+  struct { uint64_t old_off, old_end, delta; } shift[64];
+  unsigned nshift = 0;
+
+  for (MACHO_EACH_LC(&mv, lcc)) {
+    uint8_t *lcp = (uint8_t *)lcc;
+    if (!macho_is_segment(&mv, lcp))
+      continue;
+
+    MachoSeg sg;
+    macho_seg_get(&mv, lcp, &sg);
+    if (sg.vmsize == 0)
+      continue;
+
+    uint64_t noff = sg.vmaddr - image_start;
+
+    if (sg.filesize != 0) {
+      if (sg.fileoff + sg.filesize > *sizep || noff + sg.filesize > new_size) {
+        free(nbuf);
+        return -1;
+      }
+      memcpy(nbuf + noff, buf + sg.fileoff, (size_t)sg.filesize);
+
+      if (nshift < 64) {
+        shift[nshift].old_off = sg.fileoff;
+        shift[nshift].old_end = sg.fileoff + sg.filesize;
+        shift[nshift].delta = noff - sg.fileoff;
+        nshift++;
+      }
+    }
+  }
+
+  /* Header and load commands came across with __TEXT; edit them in place. */
+  MachoView nv;
+  if (macho_view(nbuf, new_size, &nv) != 0) {
+    free(nbuf);
+    return -1;
+  }
+
+  for (MACHO_EACH_LC(&nv, lcc)) {
+    uint8_t *lcp = (uint8_t *)lcc;
+    uint32_t cmd = ((const struct load_command *)lcp)->cmd;
+
+    if (macho_is_segment(&nv, lcp)) {
+      MachoSeg sg;
+      macho_seg_get(&nv, lcp, &sg);
+      if (sg.vmsize == 0)
+        continue;
+
+      uint64_t noff = sg.vmaddr - image_start;
+      macho_seg_set_addrs(&nv, lcp, sg.vmaddr, sg.vmsize, noff, sg.filesize);
+
+      uint8_t *secs = lcp + macho_seg_cmdsize(&nv);
+      for (uint32_t j = 0; j < sg.nsects; j++) {
+        uint8_t *sp = secs + (size_t)j * macho_sect_size(&nv);
+        MachoSect sec;
+        macho_sect_get(&nv, sp, &sec);
+
+        /* Zerofill sections have no file bytes; offset stays 0. */
+        uint32_t section_type = sec.flags & SECTION_TYPE;
+        bool zerofill = (section_type == S_ZEROFILL)
+#ifdef S_GB_ZEROFILL
+                        || (section_type == S_GB_ZEROFILL)
+#endif
+#ifdef S_THREAD_LOCAL_ZEROFILL
+                        || (section_type == S_THREAD_LOCAL_ZEROFILL)
+#endif
+                        ;
+        uint32_t noffset = zerofill ? 0 : (uint32_t)(sec.addr - image_start);
+        macho_sect_set(&nv, sp, sec.addr, noffset, sec.reloff);
+      }
+      continue;
+    }
+
+#define SHIFT_FIELD(field)                                                    \
+    do {                                                                      \
+      uint32_t _v = (field);                                                  \
+      if (_v != 0) {                                                          \
+        for (unsigned _i = 0; _i < nshift; _i++) {                            \
+          if (_v >= shift[_i].old_off && _v < shift[_i].old_end) {            \
+            (field) = (uint32_t)(_v + shift[_i].delta);                       \
+            break;                                                            \
+          }                                                                   \
+        }                                                                     \
+      }                                                                       \
+    } while (0)
+
+    if (cmd == LC_SYMTAB) {
+      struct symtab_command *sc = (struct symtab_command *)lcp;
+      SHIFT_FIELD(sc->symoff);
+      SHIFT_FIELD(sc->stroff);
+    } else if (cmd == LC_DYSYMTAB) {
+      struct dysymtab_command *dc = (struct dysymtab_command *)lcp;
+      SHIFT_FIELD(dc->tocoff);
+      SHIFT_FIELD(dc->modtaboff);
+      SHIFT_FIELD(dc->extrefsymoff);
+      SHIFT_FIELD(dc->indirectsymoff);
+      SHIFT_FIELD(dc->extreloff);
+      SHIFT_FIELD(dc->locreloff);
+    } else if (cmd == LC_FUNCTION_STARTS || cmd == LC_DATA_IN_CODE ||
+               cmd == LC_DYLD_CHAINED_FIXUPS || cmd == LC_DYLD_EXPORTS_TRIE) {
+      struct linkedit_data_command *ld = (struct linkedit_data_command *)lcp;
+      SHIFT_FIELD(ld->dataoff);
+    } else if (cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY) {
+      struct dyld_info_command *di = (struct dyld_info_command *)lcp;
+      SHIFT_FIELD(di->rebase_off);
+      SHIFT_FIELD(di->bind_off);
+      SHIFT_FIELD(di->weak_bind_off);
+      SHIFT_FIELD(di->lazy_bind_off);
+      SHIFT_FIELD(di->export_off);
+    }
+#undef SHIFT_FIELD
+  }
+
+  free(buf);
+  *bufp = nbuf;
+  *sizep = new_size;
+  return 0;
 }
 
 static uint64_t va_to_foff(
@@ -1211,6 +1405,11 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
 
   free(sym_addrs);
   free(sec_refs);
+
+  if (relayout_va_consistent(&buf, &sl) != 0) {
+    free(buf);
+    return -1;
+  }
 
   out->linked_data = buf;
   out->linked_size = sl;

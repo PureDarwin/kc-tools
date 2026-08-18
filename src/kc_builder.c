@@ -231,7 +231,12 @@ int main(int argc, char *argv[]) {
     }
     patch_kmod_info(lk);
     symtab_merge_from_linked(&ksyms, lk);
-    vmcursor += (lk->linked_size + 0xFFF) & ~(uint64_t)0xFFF;
+    // Space by what the kext occupies once mapped, not by its file size: a
+    // segment with vmsize > filesize (__bss, __LINKEDIT padding) runs past the
+    // end of the file image, so linked_size lets this kext's last segment
+    // overlap the next kext's header.
+    uint64_t occupied = lk->vm_extent ? lk->vm_extent : lk->linked_size;
+    vmcursor += (occupied + 0xFFF) & ~(uint64_t)0xFFF;
     nlinked++;
   }
 

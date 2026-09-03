@@ -194,6 +194,62 @@ int symtab_build_from_macho(SymTable *st, const uint8_t *data, size_t size) {
   return 0;
 }
 
+uint64_t macho_seg_vmaddr(const uint8_t *data, size_t size, const char *name) {
+  size_t sl;
+  const uint8_t *s = find_slice(data, size, &sl);
+  if (!s)
+    return 0;
+
+  MachoView mv;
+  if (macho_view(s, sl, &mv) != 0)
+    return 0;
+
+  for (MACHO_EACH_LC(&mv, lc)) {
+    if (!macho_is_segment(&mv, lc))
+      continue;
+    MachoSeg sg;
+    macho_seg_get(&mv, lc, &sg);
+    if (!strncmp(sg.segname, name, 16))
+      return sg.vmaddr;
+  }
+
+  return 0;
+}
+
+uint64_t macho_image_vm_extent(const uint8_t *data, size_t size) {
+  size_t sl;
+  const uint8_t *s = find_slice(data, size, &sl);
+  if (!s)
+    return 0;
+
+  MachoView mv;
+  if (macho_view(s, sl, &mv) != 0)
+    return 0;
+
+  uint64_t lo = UINT64_MAX, hi = 0;
+  for (MACHO_EACH_LC(&mv, lc)) {
+    if (!macho_is_segment(&mv, lc))
+      continue;
+    MachoSeg sg;
+    macho_seg_get(&mv, lc, &sg);
+    if (!sg.vmsize)
+      continue;
+    if (sg.vmaddr < lo) lo = sg.vmaddr;
+    if (sg.vmaddr + sg.vmsize > hi) hi = sg.vmaddr + sg.vmsize;
+  }
+
+  return (lo == UINT64_MAX || hi <= lo) ? 0 : hi - lo;
+}
+
+int macho_is_arm64(const uint8_t *data, size_t size) {
+  size_t sl;
+  const uint8_t *s = find_slice(data, size, &sl);
+  if (!s || sl < sizeof(struct mach_header_64))
+    return 0;
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)s;
+  return mh->magic == MH_MAGIC_64 && mh->cputype == CPU_TYPE_ARM64;
+}
+
 uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size) {
   size_t sl;
   const uint8_t *s = find_slice(data, size, &sl);

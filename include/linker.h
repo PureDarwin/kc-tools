@@ -44,6 +44,14 @@ uint64_t symtab_lookup(const SymTable *st, const char *name);
 uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size);
 uint64_t macho_exec_vm_end(const uint8_t *data, size_t size);
 
+#define ALIGN_UP_64(v, a) (((v) + ((a) - 1)) & ~(uint64_t)((a) - 1))
+
+// vmaddr of a named segment, 0 if absent.
+uint64_t macho_seg_vmaddr(const uint8_t *data, size_t size, const char *name);
+// Mapped extent (highest vmaddr+vmsize - lowest vmaddr) of an unlinked image.
+uint64_t macho_image_vm_extent(const uint8_t *data, size_t size);
+int macho_is_arm64(const uint8_t *data, size_t size);
+
 int link_kext(const uint8_t *kext_data, size_t kext_size,
               const SymTable *combined_syms, uint64_t load_vmaddr,
               LinkedKext *out);

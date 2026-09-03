@@ -151,6 +151,7 @@ int main(int argc, char *argv[]) {
   const char *codeless_paths[MAX_KEXTS];
   int num_codeless_paths = 0;
   uint64_t kext_vmbase = 0;
+  uint64_t kc_base = 0;
   int classic = 0;
 
   for (int i = 1; i < argc; i++) {
@@ -166,6 +167,8 @@ int main(int argc, char *argv[]) {
       prefix = argv[++i];
     } else if (!strcmp(argv[i], "-kext-vmbase") && i + 1 < argc) {
       kext_vmbase = strtoull(argv[++i], NULL, 16);
+    } else if (!strcmp(argv[i], "-kc-base") && i + 1 < argc) {
+      kc_base = strtoull(argv[++i], NULL, 16);
     } else if (!strcmp(argv[i], "-classic")) {
       classic = 1;
     } else {
@@ -206,6 +209,39 @@ int main(int argc, char *argv[]) {
   kvm_end = (kvm_end + 0xFFFF) & ~(uint64_t)0xFFFF; // align to 64 KB
 
   uint64_t vmcursor = kext_vmbase ? kext_vmbase : kvm_end;
+
+  /* arm64 must place the kexts *below* the kernel's __TEXT. arm_vm_init sizes
+   * the gap it protects as (segTEXTB - (segPRELINKTEXTB + segSizePRELINKTEXT)),
+   * which underflows to a ~garbage length if the collection payload sits above
+   * the kernel. i386_init has no equivalent rule, so x86 keeps appending. */
+  if (!kext_vmbase && kc_base) {
+    /* Directly above the collection header page: the payload has to stay below
+     * the kernel's __TEXT (arm_vm_init sizes the gap it protects as
+     * segTEXTB - prelink_end) and packing it against the collection base keeps
+     * the staged span small. */
+    vmcursor = kc_base + 0x4000;
+    fprintf(stderr, "kext placement: above collection header 0x%llx\n",
+            (unsigned long long)kc_base);
+  } else if (!kext_vmbase && macho_is_arm64(kernel_data, kernel_size)) {
+    uint64_t ktext = macho_seg_vmaddr(kernel_data, kernel_size, "__TEXT");
+    uint64_t total = 0;
+    for (int i = 0; i < nkexts; i++)
+      total += ALIGN_UP_64(macho_image_vm_extent(kbundles[i].binary,
+                                                 kbundles[i].binary_size), 0x1000);
+    /* Room for the prelink info/XML that prelink_assemble places after the
+     * kexts, and slack so a rounding difference cannot push into __TEXT. */
+    total = ALIGN_UP_64(total + (total / 4) + 0x100000, 0x10000);
+    if (ktext > total) {
+      vmcursor = (ktext - total) & ~(uint64_t)0xFFFF;
+      fprintf(stderr, "kext placement: below kernel __TEXT 0x%llx, "
+              "reserving 0x%llx\n", (unsigned long long)ktext,
+              (unsigned long long)total);
+    } else {
+      fprintf(stderr, "kext placement: WARNING kernel __TEXT 0x%llx leaves no "
+              "room for 0x%llx of kexts; falling back above the kernel\n",
+              (unsigned long long)ktext, (unsigned long long)total);
+    }
+  }
   fprintf(stderr, "kext placement start: 0x%llx\n", (unsigned long long)vmcursor);
 
   LinkedKext linked[MAX_KEXTS];
@@ -293,7 +329,7 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "prelink_assemble failed\n");
       return 1;
     }
-  } else if (fileset_assemble(kernel_data, kernel_size, linked, (size_t)nlinked,
+  } else if (fileset_assemble(kernel_data, kernel_size, linked, (size_t)nlinked, kc_base,
                        &out_data, &out_size) != 0) {
     fprintf(stderr, "fileset_assemble failed\n");
     return 1;

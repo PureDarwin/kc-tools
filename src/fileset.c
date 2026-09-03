@@ -298,28 +298,198 @@ typedef struct {
   const struct segment_command_64 *lc;  // pointer into kernel_data
 } SegRef;
 
-// Earlier revisions of this tool appended a separate synthetic "__KCHDR"
-// segment (its own mach_header_64 + load commands) after the whole image,
-// carrying the MH_FILESET wrapper. That broke XNU's kernel_collection_slide()
-// (osfmk/mach/dyld_kernel_fixups.h): it derives its own internal "slide" as
-// (uintptr_t)kc_mh - textVMAddr, where textVMAddr comes from kc_mh's own
-// copy of the __TEXT segment command. Real Apple KCs have their MH_FILESET
-// header co-located with the image's own __TEXT (so that delta is always
-// the genuine KASLR slide, 0 here); our appended-at-the-end __KCHDR made it
-// a huge bogus value, and every subsequent address computation (including
-// the chained-fixups header address) landed in unmapped memory.
-//
-// Fix: convert the kernel's OWN mach_header_64 in place into the MH_FILESET
-// header, append LC_FILESET_ENTRY (kernel + each real kext) and
-// LC_DYLD_CHAINED_FIXUPS directly onto its EXISTING load command list,
-// reusing its EXISTING LC_SEGMENT_64 entries verbatim (no separate segment
-// copies needed). This makes kc_mh and textVMAddr the literal same object,
-// so that internal slide is trivially 0 by construction, no address
-// arithmetic to get wrong. Apple kernels reserve generous zero padding
-// between the end of their load commands and the first real segment's file
-// content specifically to allow this kind of in-place growth.
+/* Shift every file offset in a load-command block by `delta`. Only the command
+ * kinds our KCs actually carry are handled; anything else that stores a file
+ * offset would silently survive unshifted, so bail loudly instead. */
+static int
+shift_lc_file_offsets(uint8_t *mh_base, uint64_t delta)
+{
+  struct mach_header_64 *mh = (struct mach_header_64 *)mh_base;
+  uint8_t *lcp = mh_base + sizeof(*mh);
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    struct load_command *lc = (struct load_command *)lcp;
+    switch (lc->cmd) {
+    case LC_SEGMENT_64: {
+      struct segment_command_64 *sc = (struct segment_command_64 *)lcp;
+      /* A zero-length segment keeps fileoff 0; shifting it would invent a
+       * location for something that has no bytes in the file. */
+      if (sc->filesize)
+        sc->fileoff += delta;
+      struct section_64 *sects = (struct section_64 *)(sc + 1);
+      for (uint32_t n = 0; n < sc->nsects; n++) {
+        if (sects[n].size && sects[n].flags != S_ZEROFILL)
+          sects[n].offset += (uint32_t)delta;
+        if (sects[n].nreloc)
+          sects[n].reloff += (uint32_t)delta;
+      }
+      break;
+    }
+    case LC_SYMTAB: {
+      struct symtab_command *st = (struct symtab_command *)lcp;
+      if (st->nsyms) st->symoff += (uint32_t)delta;
+      if (st->strsize) st->stroff += (uint32_t)delta;
+      break;
+    }
+    case LC_DYSYMTAB: {
+      struct dysymtab_command *dst = (struct dysymtab_command *)lcp;
+      if (dst->nindirectsyms) dst->indirectsymoff += (uint32_t)delta;
+      if (dst->nextrel)       dst->extreloff     += (uint32_t)delta;
+      if (dst->nlocrel)       dst->locreloff     += (uint32_t)delta;
+      break;
+    }
+    case LC_DYLD_CHAINED_FIXUPS:
+    case LC_FUNCTION_STARTS:
+    case LC_DATA_IN_CODE: {
+      struct linkedit_data_command *ld = (struct linkedit_data_command *)lcp;
+      if (ld->datasize) ld->dataoff += (uint32_t)delta;
+      break;
+    }
+    case LC_FILESET_ENTRY: {
+      struct fileset_entry_command *fe = (struct fileset_entry_command *)lcp;
+      fe->fileoff += delta;
+      break;
+    }
+    case LC_UUID:
+    case LC_BUILD_VERSION:
+    case LC_SOURCE_VERSION:
+    case LC_UNIXTHREAD:
+    case LC_VERSION_MIN_MACOSX:
+      break;
+    default:
+      fprintf(stderr, "fileset: cannot shift unknown load command 0x%x\n", lc->cmd);
+      return -1;
+    }
+    lcp += lc->cmdsize;
+  }
+  return 0;
+}
+
+/*
+ * Split the shared header into a collection header and a kernel header.
+ *
+ * XNU finds the collection header at VM_KERNEL_LINK_ADDRESS + slide, so kc_base
+ * must equal the ARM64_KC_BASE the kernel was compiled with.
+ */
+#define KC_HDR_SIZE 0x4000ULL
+
+static int
+split_collection_header(uint8_t **io_out, size_t *io_len, uint64_t kc_base,
+                        uint64_t prelink_text_vmaddr, uint64_t prelink_text_size,
+                        uint64_t prelink_info_vmaddr, uint64_t prelink_info_size)
+{
+  uint8_t *out = *io_out;
+  size_t out_len = *io_len;
+  const struct mach_header_64 *src = (const struct mach_header_64 *)out;
+  size_t lc_bytes = sizeof(*src) + src->sizeofcmds;
+
+  if (lc_bytes > KC_HDR_SIZE) {
+    fprintf(stderr, "fileset: load commands (0x%zx) exceed the collection "
+            "header page (0x%llx)\n", lc_bytes, (unsigned long long)KC_HDR_SIZE);
+    return -1;
+  }
+
+  size_t new_len = out_len + KC_HDR_SIZE;
+  uint8_t *out2 = calloc(1, new_len);
+  if (!out2)
+    return -1;
+
+  /* Kernel image moves up one page; the collection header takes file 0. */
+  memcpy(out2 + KC_HDR_SIZE, out, out_len);
+  if (shift_lc_file_offsets(out2 + KC_HDR_SIZE, KC_HDR_SIZE) != 0) {
+    free(out2);
+    return -1;
+  }
+
+  /* The collection header is the same command block, so it needs the same
+   * shift; copy it from the already-shifted kernel header. */
+  memcpy(out2, out2 + KC_HDR_SIZE, lc_bytes);
+
+  struct mach_header_64 *kmh = (struct mach_header_64 *)(out2 + KC_HDR_SIZE);
+  struct mach_header_64 *cmh = (struct mach_header_64 *)out2;
+
+  kmh->filetype = MH_EXECUTE;              /* an entry inside the collection */
+  kmh->flags |= MH_DYLIB_IN_CACHE;         /* what XNU tests to take the KC path */
+  cmh->filetype = MH_FILESET;
+
+  /* Kernel side: prelink segments must read back empty. */
+  {
+    uint8_t *lcp = (uint8_t *)kmh + sizeof(*kmh);
+    for (uint32_t i = 0; i < kmh->ncmds; i++) {
+      struct load_command *lc = (struct load_command *)lcp;
+      if (lc->cmd == LC_SEGMENT_64) {
+        struct segment_command_64 *sc = (struct segment_command_64 *)lcp;
+        if (!memcmp(sc->segname, "__PRELINK_TEXT", 14) ||
+            !memcmp(sc->segname, "__PRELINK_INFO", 14)) {
+          sc->vmsize = 0;
+          sc->filesize = 0;
+        }
+      }
+      lcp += lc->cmdsize;
+    }
+  }
+
+  /* Collection side: publish the real payload extents, and give the header
+   * page a segment of its own so it is mapped and is the lowest vmaddr. */
+  {
+    uint8_t *lcp = (uint8_t *)cmh + sizeof(*cmh);
+    struct segment_command_64 *first_seg = NULL;
+    for (uint32_t i = 0; i < cmh->ncmds; i++) {
+      struct load_command *lc = (struct load_command *)lcp;
+      if (lc->cmd == LC_SEGMENT_64) {
+        struct segment_command_64 *sc = (struct segment_command_64 *)lcp;
+        if (!first_seg)
+          first_seg = sc;
+        if (!memcmp(sc->segname, "__PRELINK_TEXT", 14) && prelink_text_size) {
+          sc->vmaddr = prelink_text_vmaddr;
+          sc->vmsize = prelink_text_size;
+        }
+        if (!memcmp(sc->segname, "__PRELINK_INFO", 14) && prelink_info_size) {
+          sc->vmaddr = prelink_info_vmaddr;
+          sc->vmsize = prelink_info_size;
+        }
+      }
+      lcp += lc->cmdsize;
+    }
+    (void)first_seg;
+    /* Append - never prepend - a segment for the header page itself. The
+     * chained-fixup starts table is indexed by segment number, so inserting at
+     * the front would silently misattribute every fixup page. Appending leaves
+     * indices 0..n-1 alone; the extra segment simply has no fixups, and
+     * seg_count stopping short of it is harmless because a header page holds no
+     * pointers to rebase. */
+    struct segment_command_64 *kcseg =
+        (struct segment_command_64 *)((uint8_t *)cmh + sizeof(*cmh) + cmh->sizeofcmds);
+    if (sizeof(*cmh) + cmh->sizeofcmds + sizeof(*kcseg) > KC_HDR_SIZE) {
+      fprintf(stderr, "fileset: no room for the collection __TEXT command\n");
+      free(out2);
+      return -1;
+    }
+    memset(kcseg, 0, sizeof(*kcseg));
+    kcseg->cmd = LC_SEGMENT_64;
+    kcseg->cmdsize = sizeof(*kcseg);
+    memcpy(kcseg->segname, "__TEXT", 6);
+    kcseg->vmaddr = kc_base;
+    kcseg->vmsize = KC_HDR_SIZE;
+    kcseg->fileoff = 0;
+    kcseg->filesize = KC_HDR_SIZE;
+    kcseg->maxprot = VM_PROT_READ | VM_PROT_EXECUTE;
+    kcseg->initprot = VM_PROT_READ | VM_PROT_EXECUTE;
+    cmh->ncmds += 1;
+    cmh->sizeofcmds += sizeof(*kcseg);
+  }
+
+  fprintf(stderr, "fileset: collection header at vm 0x%llx (kernel image "
+          "shifted to file 0x%llx)\n", (unsigned long long)kc_base,
+          (unsigned long long)KC_HDR_SIZE);
+
+  free(out);
+  *io_out = out2;
+  *io_len = new_len;
+  return 0;
+}
+
 int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
-                     LinkedKext *kexts, size_t num_kexts,
+                     LinkedKext *kexts, size_t num_kexts, uint64_t kc_base,
                      uint8_t **out_data, size_t *out_size)
 {
   uint64_t arm64_entry = 0;
@@ -488,6 +658,12 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   // within the KC file.
   uint64_t pt_vmaddr  = prelink_text ? prelink_text->vmaddr  : 0;
   uint64_t pt_fileoff = prelink_text ? prelink_text->fileoff : 0;
+  /* Captured here because prelink_text/prelink_info point into base_data, which
+   * is freed once it has been copied into the output buffer. */
+  uint64_t kc_pt_vmaddr = pt_vmaddr;
+  uint64_t kc_pt_vmsize = prelink_text ? prelink_text->vmsize : 0;
+  uint64_t kc_pi_vmaddr = prelink_info ? prelink_info->vmaddr : 0;
+  uint64_t kc_pi_vmsize = prelink_info ? prelink_info->vmsize : 0;
   uint32_t kext_fe_cmdsize[64];
   uint32_t kext_fe_total = 0;
   size_t   n_kext_fe = (prelink_text ? num_kexts : 0);
@@ -507,17 +683,20 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   for (size_t i = 0; i < n_kext_fe; i++)
     if (kext_fe_cmdsize[i]) n_real_fe++;
 
-  /* XNU's kernel entry expects the three PRELINK commands to exist, but
-   * arm_vm_init requires them to describe an empty kernel-side prelink area.
-   * Keep those original commands as zero-sized placeholders and append
-   * copies under KC-private names for the collection payload.
+  /* Both arches now keep the collection payload in __PRELINK_TEXT at its real
+   * size; payload_segs stays only so the x86 paths below compile unchanged.
    *
-   * This is an arm64-only requirement. i386_init has no equivalent rule: on
-   * x86 XNU still expects the payload to live in __PRELINK_TEXT/__PRELINK_INFO
-   * at their real sizes, and OSKext::start() resolves a kext's start function
-   * through them. Republishing the payload as __TEXT_EXEC/__KEXT_DATA and
-   * zeroing the prelink commands there makes every kext fail to start with
-   * "memory region containing module start function is not executable". */
+   * The old arm64 path republished the payload as a second __TEXT_EXEC plus a
+   * __KEXT_DATA per kext, because arm_vm_init asserts the *kernel-side* prelink
+   * segments are empty. But in a fileset KC the kernel's mach_header and the
+   * collection header are the same object, so those asserts read the very value
+   * XNU is about to overwrite with getsegdatafromheader(kc_mh, ...) - and they
+   * are asserts, compiled out in RELEASE. A second __TEXT_EXEC is actively
+   * wrong: getsegdatafromheader returns the *first* match, so segKCTEXTEXECB
+   * came out equal to the kernel's own __TEXT_EXEC and
+   *   segSizePLKTEXTEXEC = segSizeKCTEXTEXEC - (segLASTB - segKCTEXTEXECB)
+   * evaluated to exactly 0. Kext text and data were never mapped, and the first
+   * kext header read faulted. */
   struct {
     uint8_t *data;
     uint32_t size;
@@ -532,7 +711,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   const char *payload_names[2] = {
     "__DATA", "__TEXT_EXEC"
   };
-  for (size_t i = 0; kc_is_arm64 && i < 2; i++) {
+  for (size_t i = 0; 0 && i < 2; i++) {
     if (!payload_sources[i]) continue;
     payload_segs[payload_seg_count].size = payload_sources[i]->cmdsize;
     payload_segs[payload_seg_count].data = malloc(payload_sources[i]->cmdsize);
@@ -552,7 +731,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
    * file range. The aggregate KC text command must not own the kext data
    * pages, so publish those original non-executable segments separately with
    * the same file-to-VM delta. */
-  for (size_t j = 0; kc_is_arm64 && j < num_kexts; j++) {
+  for (size_t j = 0; 0 && j < num_kexts; j++) {
     if (kexts[j].codeless || !kexts[j].linked_data ||
         kexts[j].linked_size < sizeof(struct mach_header_64))
       continue;
@@ -643,7 +822,8 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   if (!has_chained_fixups) {
     if (mh->cputype == CPU_TYPE_ARM64 &&
         build_kernel_cache_fixups(base_data, base_size, mh, segs, nsegs,
-            first_seg_vmaddr, &fixups_blob, &fixups_size) != 0) {
+            kc_base ? kc_base : first_seg_vmaddr,
+            &fixups_blob, &fixups_size) != 0) {
       fprintf(stderr, "fileset: ARM64 chained fixup generation failed\n");
       fixups_size = 0;
     }
@@ -791,8 +971,13 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           sc->filesize = 0;
           sc->vmsize = 0;
         }
-        /* Zeroing the prelink commands is part of the same arm64-only
-         * republish: on x86 the payload stays in them (see kc_is_arm64). */
+        /* __PRELINK_DATA must stay empty and sit at the end of the kernel's
+         * __DATA. XNU computes
+         *   segSizePRELINKDATA = segSizeKCDATA - (segPRELINKDATAB - segKCDATAB)
+         * in unsigned arithmetic, so a __PRELINK_DATA below __DATA underflows
+         * into a ~13MB RWNX mapping over the kernel's own __TEXT/__TEXT_EXEC.
+         * Our kexts keep their __DATA inside the whole-kext image in
+         * __PRELINK_TEXT, so an empty region here is also the truth. */
         if (kc_is_arm64 && !memcmp(sc->segname, "__PRELINK_DATA", 14)) {
           uint64_t original_vmaddr = sc->vmaddr;
           struct section_64 *sects = (struct section_64 *)(sc + 1);
@@ -805,7 +990,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           sc->vmsize = 0;
           if (data_end_vmaddr)
             sc->vmaddr = data_end_vmaddr;
-        } else if (kc_is_arm64 &&
+        } else if (0 &&
                    (!memcmp(sc->segname, "__PRELINK_TEXT", 14) ||
                     !memcmp(sc->segname, "__PRELINK_INFO", 14))) {
           struct section_64 *sects = (struct section_64 *)(sc + 1);
@@ -949,6 +1134,15 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
           "ncmds=%u sizeofcmds=%u (grew by %u bytes), fixups at fileoff=0x%zx\n",
           (unsigned long long)first_seg_vmaddr, omh->ncmds, omh->sizeofcmds,
           new_cmds_size, fixups_off);
+
+  if (kc_base) {
+    if (split_collection_header(&out, &out_len, kc_base,
+                                kc_pt_vmaddr, kc_pt_vmsize,
+                                kc_pi_vmaddr, kc_pi_vmsize) != 0) {
+      free(out);
+      return -1;
+    }
+  }
 
   *out_data = out;
   *out_size = out_len;

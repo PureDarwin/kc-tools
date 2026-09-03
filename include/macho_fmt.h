@@ -36,8 +36,12 @@
 #define LC_UUID               0x1b
 #define LC_UNIXTHREAD         0x5
 #define LC_VERSION_MIN_MACOSX 0x24
-#define LC_SOURCE_VERSION     0x42
+/* 0x2A. Was 0x42 here, which is not a load command at all; nothing read it
+ * until the collection-header split needed to classify every command. */
+#define LC_SOURCE_VERSION     0x2a
 #define LC_BUILD_VERSION      0x32
+#define LC_FUNCTION_STARTS    0x26
+#define LC_DATA_IN_CODE       0x29
 // LC_DYLD_INFO / struct dyld_info_command moved into ../kc-tools/shared/linker.c
 // (its only consumer), so the shared linker stays self-contained.
 #define LC_DYLD_CHAINED_FIXUPS (0x34 | LC_REQ_DYLD)

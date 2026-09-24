@@ -130,6 +130,7 @@ struct dyld_chained_fixups_header {
 #define ARM_RELOC_PB_LA_PTR     4
 #define ARM_RELOC_BR24          5
 #define ARM_THUMB_RELOC_BR22    6
+#define N_ARM_THUMB_DEF         0x0008  /* n_desc: symbol is a Thumb function */
 #define ARM_THUMB_32BIT_BRANCH  7
 #define ARM_RELOC_HALF          8
 #define ARM_RELOC_HALF_SECTDIFF 9

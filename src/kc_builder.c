@@ -222,6 +222,22 @@ int main(int argc, char *argv[]) {
     vmcursor = kc_base + 0x4000;
     fprintf(stderr, "kext placement: above collection header 0x%llx\n",
             (unsigned long long)kc_base);
+    /* The payload must end below the kernel's __TEXT, or it overwrites the
+     * kernel once loaded (seen as a silent hang after MMU enable). */
+    if (macho_is_arm64(kernel_data, kernel_size)) {
+      uint64_t ktext = macho_seg_vmaddr(kernel_data, kernel_size, "__TEXT");
+      uint64_t total = 0;
+      for (int i = 0; i < nkexts; i++)
+        total += ALIGN_UP_64(macho_image_vm_extent(kbundles[i].binary,
+                                                   kbundles[i].binary_size), 0x1000);
+      if (ktext && vmcursor + total > ktext) {
+        fprintf(stderr, "kext placement: payload 0x%llx bytes from 0x%llx runs "
+                "over kernel __TEXT 0x%llx; lower -kc-base (and ARM64_KC_BASE)\n",
+                (unsigned long long)total, (unsigned long long)vmcursor,
+                (unsigned long long)ktext);
+        return 1;
+      }
+    }
   } else if (!kext_vmbase && macho_is_arm64(kernel_data, kernel_size)) {
     uint64_t ktext = macho_seg_vmaddr(kernel_data, kernel_size, "__TEXT");
     uint64_t total = 0;

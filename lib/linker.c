@@ -185,7 +185,9 @@ int symtab_build_from_macho(SymTable *st, const uint8_t *data, size_t size) {
     if (n.n_type & N_STAB)
       continue;   /* debug entry, not a real definition */
     if ((n.n_type & N_EXT) && (n.n_type & 0xe) == N_SECT && n.n_value)
-      symtab_add(st, strtab + n.n_strx, n.n_value);
+      /* ARM: carry the Thumb bit in bit 0, as a function pointer would */
+      symtab_add(st, strtab + n.n_strx,
+                 n.n_value | (mv.cputype == CPU_TYPE_ARM && (n.n_desc & N_ARM_THUMB_DEF) ? 1 : 0));
   }
 
   qsort(st->syms, st->count, sizeof(Sym), sym_cmp);
@@ -405,7 +407,8 @@ int symtab_merge_from_linked(SymTable *st, const LinkedKext *lk) {
       continue;
     }
 
-    symtab_add(st, name, n->n_value);
+    symtab_add(st, name,
+               n->n_value | (mv.cputype == CPU_TYPE_ARM && (n->n_desc & N_ARM_THUMB_DEF) ? 1 : 0));
     added++;
   }
 
@@ -1053,6 +1056,8 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
       // But store it as-is and let the write-back be the canonical source
       macho_sym_set_value(&mv, nl, i, load_vmaddr + n->n_value);
       sym_addrs[i] = load_vmaddr + n->n_value;
+      if (is_arm32 && (n->n_desc & N_ARM_THUMB_DEF))
+        sym_addrs[i] |= 1;
     } else if (type == N_ABS) {
       sym_addrs[i] = n->n_value;
     } else if (type == N_UNDF && !(n->n_type & N_STAB)) {
@@ -1181,7 +1186,22 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
               /* B/BL: signed 24-bit word displacement, pc reads as insn + 8. */
               uint32_t insn = r32(loc);
               int32_t addend = (int32_t)((insn & 0x00ffffffu) << 8) >> 6;
-              int64_t rel = (int64_t)target + addend - (int64_t)(pc + 8);
+              int thumb = (int)(target & 1);
+              int64_t rel = (int64_t)(target & ~1ULL) + addend - (int64_t)(pc + 8);
+              if (thumb) {
+                /* ARM caller, Thumb callee: BL becomes BLX (imm), H is offset bit 1 */
+                if ((insn & 0x0f000000u) != 0x0b000000u || (insn >> 28) != 0xe ||
+                    (rel & 1) || rel < -33554432LL || rel > 33554430LL) {
+                  fprintf(stderr, "  WARN: BR24 to Thumb not convertible (insn=%08x rel=%lld)\n",
+                          insn, (long long)rel);
+                  nerrs++;
+                  break;
+                }
+                insn = 0xfa000000u | ((uint32_t)((rel >> 1) & 1) << 24) |
+                       (((uint32_t)(rel >> 2)) & 0x00ffffffu);
+                w32(loc, insn);
+                break;
+              }
               if ((rel & 3) || rel < -33554432LL || rel > 33554428LL) {
                 fprintf(stderr, "  WARN: BR24 out of range (rel=%lld)\n",
                         (long long)rel);

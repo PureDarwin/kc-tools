@@ -9,6 +9,7 @@
 /* arm64 XNU is built for a 16KB page granule; segment vmaddrs it maps or frees
  * must respect that, not the 4KB PAGE used for file layout above. */
 #define ARM64_KERNEL_PAGE 0x4000ULL
+#define RISCV64_KERNEL_PAGE 0x1000ULL
 #define ALIGN_UP(x, a) (((uint64_t)(x) + ((uint64_t)(a) - 1)) & ~((uint64_t)(a) - 1))
 
 #define DYLD_CHAINED_PTR_64_KERNEL_CACHE 8
@@ -80,6 +81,14 @@ kernel_arm64_set_entry(uint8_t *data, size_t data_size,
               (unsigned long long)entry);
           return;
         }
+        // riscv64 keeps x0-x31 then pc
+        if (mh->cputype == CPU_TYPE_RISCV64 && flavor == RISCV_THREAD_STATE64 &&
+            state_size >= (RISCV_THREAD_STATE64_PC + 1) * sizeof(uint64_t)) {
+          *(uint64_t *)(state + RISCV_THREAD_STATE64_PC * sizeof(uint64_t)) = entry;
+          fprintf(stderr, "fileset: RISCV64 LC_UNIXTHREAD entry -> 0x%llx\n",
+              (unsigned long long)entry);
+          return;
+        }
         q = state + state_size;
       }
       return;
@@ -105,7 +114,7 @@ static int
 build_kernel_cache_fixups(uint8_t *data, size_t data_size,
     const struct mach_header_64 *mh,
     const struct segment_command_64 *const *segs, size_t nsegs,
-    uint64_t base_vmaddr,
+    uint64_t base_vmaddr, const LinkedKext *kexts, size_t num_kexts,
     uint8_t **out_blob, uint32_t *out_size)
 {
   const struct dysymtab_command *dysymtab = NULL;
@@ -181,6 +190,34 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
     }
   }
 
+  // every pointer kc-builder wrote into a kext slides with the collection too, and kext
+  // data sits inside the r-x __PRELINK_TEXT, so no executable-segment filter here
+  uint32_t kext_sites = 0;
+  for (size_t k = 0; k < num_kexts; k++) {
+    for (size_t n = 0; n < kexts[k].nptr_slots; n++) {
+      uint64_t vm = kexts[k].ptr_slots[n];
+      for (size_t si = 0; si < nsegs; si++) {
+        if (segs[si]->filesize == 0 || vm < segs[si]->vmaddr ||
+            vm + 8 > segs[si]->vmaddr + segs[si]->filesize)
+          continue;
+        uint64_t fileoff = segs[si]->fileoff + (vm - segs[si]->vmaddr);
+        if (fileoff + 8 > data_size)
+          break;
+        if (counts[si] == caps[si]) {
+          uint32_t next = caps[si] ? caps[si] * 2 : 64;
+          FixupSite *grown = realloc(sites[si], next * sizeof(*grown));
+          if (!grown) goto fail;
+          sites[si] = grown;
+          caps[si] = next;
+        }
+        sites[si][counts[si]++] = (FixupSite){fileoff, (uint32_t)si};
+        kext_sites++;
+        break;
+      }
+    }
+  }
+  fprintf(stderr, "fileset: kext pointer sites=%u\n", kext_sites);
+
   /* One chain per page is always sufficient: any two 8-byte-aligned slots on
    * the same 0x1000 page are at most 0xff8 apart, well within the 12-bit next
    * field's 0x3ffc reach. So each segment needs only its per-page start table
@@ -243,9 +280,13 @@ build_kernel_cache_fixups(uint8_t *data, size_t data_size,
     uint32_t prev_fileoff = 0;
     uint32_t open_page = UINT32_MAX;
     for (uint32_t j = 0; j < counts[si]; j++) {
+      // a slot seen twice would chain to itself and end the page early
+      if (j && sites[si][j].fileoff == sites[si][j - 1].fileoff)
+        continue;
       uint64_t off = sites[si][j].fileoff - segs[si]->fileoff;
       uint32_t page = (uint32_t)(off / 0x1000);
-      if (page >= pages || (off & 7) != 0)
+      // the kernel cache format chains in 4-byte steps, kmod_info's packed pointers need that
+      if (page >= pages || (off & 3) != 0)
         continue;
       if (sites[si][j].fileoff + 8 > data_size)
         continue;
@@ -496,7 +537,8 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   if (kernel_size >= sizeof(struct mach_header_64)) {
     const struct mach_header_64 *input_mh =
         (const struct mach_header_64 *)kernel_data;
-    if (input_mh->magic == MH_MAGIC_64 && input_mh->cputype == CPU_TYPE_ARM64)
+    if (input_mh->magic == MH_MAGIC_64 && (input_mh->cputype == CPU_TYPE_ARM64 ||
+                                           input_mh->cputype == CPU_TYPE_RISCV64))
       arm64_entry = kernel_arm64_start(kernel_data, kernel_size, input_mh);
   }
 
@@ -523,8 +565,11 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
    * XML) all exist to satisfy arm_vm_init. i386_init has no equivalent
    * requirements and XNU's x86 path still reads the payload out of the
    * original prelink segments, so they must not be applied there. */
-  const int kc_is_arm64 =
-      (mh->magic == MH_MAGIC_64 && mh->cputype == CPU_TYPE_ARM64);
+  // riscv64's vm init is a port of arm_vm_init, so it takes the same layout on 4K pages
+  const int kc_is_arm64 = (mh->magic == MH_MAGIC_64 &&
+      (mh->cputype == CPU_TYPE_ARM64 || mh->cputype == CPU_TYPE_RISCV64));
+  const uint64_t kernel_page =
+      mh->cputype == CPU_TYPE_RISCV64 ? RISCV64_KERNEL_PAGE : ARM64_KERNEL_PAGE;
   if (mh->magic != MH_MAGIC_64) {
     fprintf(stderr, "fileset: kernel not MH_MAGIC_64 (0x%x)\n", mh->magic);
     if (base_owned)
@@ -820,11 +865,12 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
   uint8_t *fixups_blob = NULL;
   uint32_t fixups_size = 0;
   if (!has_chained_fixups) {
-    if (mh->cputype == CPU_TYPE_ARM64 &&
+    // riscv64 local relocations share arm64's shape, type 0 is the plain pointer
+    if ((mh->cputype == CPU_TYPE_ARM64 || mh->cputype == CPU_TYPE_RISCV64) &&
         build_kernel_cache_fixups(base_data, base_size, mh, segs, nsegs,
-            kc_base ? kc_base : first_seg_vmaddr,
+            kc_base ? kc_base : first_seg_vmaddr, kexts, num_kexts,
             &fixups_blob, &fixups_size) != 0) {
-      fprintf(stderr, "fileset: ARM64 chained fixup generation failed\n");
+      fprintf(stderr, "fileset: kernel chained fixup generation failed\n");
       fixups_size = 0;
     }
     if (!fixups_blob) {
@@ -947,7 +993,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
 
   struct mach_header_64 *omh = (struct mach_header_64 *)out;
 
-  if (omh->cputype == CPU_TYPE_ARM64)
+  if (omh->cputype == CPU_TYPE_ARM64 || omh->cputype == CPU_TYPE_RISCV64)
     kernel_arm64_set_entry(out, out_len, omh, arm64_entry);
 
   /* Preserve non-null, zero-sized PRELINK placeholders for the embedded
@@ -1004,7 +1050,7 @@ int fileset_assemble(const uint8_t *kernel_data, size_t kernel_size,
                   (sects[s].offset - sc->fileoff);
           sc->filesize = 0;
           sc->vmsize = 0;
-          sc->vmaddr = mapped_vmaddr & ~(ARM64_KERNEL_PAGE - 1);
+          sc->vmaddr = mapped_vmaddr & ~(kernel_page - 1);
         }
       }
       lcp += lc->cmdsize;

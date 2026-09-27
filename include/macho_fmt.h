@@ -18,6 +18,8 @@
 #define CPU_TYPE_X86_64 ((int)(7 | 0x01000000))
 #define CPU_TYPE_ARM64  ((int)(12 | 0x01000000))
 #define CPU_TYPE_ARM    ((int)12)
+// riscv as ld64 numbers it, 24 with the 64-bit abi bit
+#define CPU_TYPE_RISCV64 ((int)(24 | 0x01000000))
 #define CPU_SUBTYPE_ALL 0
 #define CPU_SUBTYPE_ARM_V6  6
 #define CPU_SUBTYPE_ARM_V7  9
@@ -60,6 +62,11 @@
 #define ARM_THREAD_STATE       1
 #define ARM_THREAD_STATE_CNT   17   // uint32 count
 #define ARM_THREAD_STATE_PC    15   // index of pc within the state
+
+// riscv64 thread state (for LC_UNIXTHREAD entry): x0-x31 then pc, all 64-bit
+#define RISCV_THREAD_STATE64     1
+#define RISCV_THREAD_STATE64_CNT 66   // uint32 count
+#define RISCV_THREAD_STATE64_PC  32   // index of pc within the state
 
 // LC_FILESET_ENTRY payload
 struct fileset_entry_command {

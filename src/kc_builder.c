@@ -224,7 +224,7 @@ int main(int argc, char *argv[]) {
             (unsigned long long)kc_base);
     /* The payload must end below the kernel's __TEXT, or it overwrites the
      * kernel once loaded (seen as a silent hang after MMU enable). */
-    if (macho_is_arm64(kernel_data, kernel_size)) {
+    if (macho_uses_arm_kc_layout(kernel_data, kernel_size)) {
       uint64_t ktext = macho_seg_vmaddr(kernel_data, kernel_size, "__TEXT");
       uint64_t total = 0;
       for (int i = 0; i < nkexts; i++)
@@ -238,7 +238,7 @@ int main(int argc, char *argv[]) {
         return 1;
       }
     }
-  } else if (!kext_vmbase && macho_is_arm64(kernel_data, kernel_size)) {
+  } else if (!kext_vmbase && macho_uses_arm_kc_layout(kernel_data, kernel_size)) {
     uint64_t ktext = macho_seg_vmaddr(kernel_data, kernel_size, "__TEXT");
     uint64_t total = 0;
     for (int i = 0; i < nkexts; i++)

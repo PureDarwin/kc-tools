@@ -252,6 +252,16 @@ int macho_is_arm64(const uint8_t *data, size_t size) {
   return mh->magic == MH_MAGIC_64 && mh->cputype == CPU_TYPE_ARM64;
 }
 
+int macho_uses_arm_kc_layout(const uint8_t *data, size_t size) {
+  size_t sl;
+  const uint8_t *slice = find_slice(data, size, &sl);
+  if (!slice || sl < sizeof(struct mach_header_64))
+    return 0;
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)slice;
+  return mh->magic == MH_MAGIC_64 &&
+         (mh->cputype == CPU_TYPE_ARM64 || mh->cputype == CPU_TYPE_RISCV64);
+}
+
 uint64_t macho_kernel_vm_end(const uint8_t *data, size_t size) {
   size_t sl;
   const uint8_t *s = find_slice(data, size, &sl);
@@ -883,6 +893,7 @@ int patch_kmod_info(LinkedKext *lk) {
   if (mv.is64) {
     w64(lk->linked_data + addr_foff, image_start);
     w64(lk->linked_data + size_foff, image_size);
+    // address stays unslid on purpose, OSKext adds the kext slide to it itself
   } else {
     w32(lk->linked_data + addr_foff, (uint32_t)image_start);
     w32(lk->linked_data + size_foff, (uint32_t)image_size);
@@ -972,6 +983,214 @@ static uint64_t find_defined_kmod_info(
     return 0;
 }
 
+// final vmaddrs of pointers link_kext wrote, the collection chains them so they slide
+typedef struct { uint64_t *v; size_t n, cap; } SlotList;
+
+static void slot_add(SlotList *sl, uint64_t vm) {
+  if (!sl)
+    return;
+  if (sl->n == sl->cap) {
+    size_t cap = sl->cap ? sl->cap * 2 : 256;
+    uint64_t *v = realloc(sl->v, cap * sizeof(*v));
+    if (!v)
+      return;
+    sl->v = v;
+    sl->cap = cap;
+  }
+  sl->v[sl->n++] = vm;
+}
+
+// the file location of an original (unslid) vmaddr, or NULL outside the file
+static uint8_t *seg_loc(uint8_t *buf, size_t sl, const SegInfo *seginfo,
+                        uint32_t nseginfo, uint64_t vmaddr, uint64_t width) {
+  for (uint32_t i = 0; i < nseginfo; i++) {
+    if (vmaddr < seginfo[i].vmaddr ||
+        vmaddr + width > seginfo[i].vmaddr + seginfo[i].filesize)
+      continue;
+    uint64_t off = seginfo[i].fileoff + (vmaddr - seginfo[i].vmaddr);
+    return off + width <= sl ? buf + off : NULL;
+  }
+  return NULL;
+}
+
+static uint64_t resolve_import(const SymTable *kernel_syms, const char *name,
+                               uint64_t trampoline) {
+  uint64_t v = symtab_lookup(kernel_syms, name);
+  if (!v && name[0] == '_')
+    v = symtab_lookup(kernel_syms, name + 1);
+  if (!v) {
+    fprintf(stderr, "  BIND UNRESOLVED (-> panic trampoline): %s\n", name);
+    v = trampoline;
+  }
+  return v;
+}
+
+#define DYLD_CHAINED_PTR_64        2
+#define DYLD_CHAINED_PTR_64_OFFSET 6
+#define DYLD_CHAINED_PTR_START_NONE_ 0xffff
+#define DYLD_CHAINED_IMPORT          1
+#define DYLD_CHAINED_IMPORT_ADDEND   2
+#define DYLD_CHAINED_IMPORT_ADDEND64 3
+
+// chained fixups as ld64 writes them for riscv64 bundles, each slot becomes a
+// plain pointer and the chains are emptied so nothing walks them twice
+static int apply_chained_fixups(uint8_t *buf, size_t sl, uint8_t *cmd,
+                                const SegInfo *seginfo, uint32_t nseginfo,
+                                uint64_t load_vmaddr, const SymTable *kernel_syms,
+                                uint64_t trampoline, SlotList *slots) {
+  const struct linkedit_data_command *lc = (const struct linkedit_data_command *)cmd;
+  if ((uint64_t)lc->dataoff + lc->datasize > sl ||
+      lc->datasize < sizeof(struct dyld_chained_fixups_header))
+    return -1;
+  uint8_t *blob = buf + lc->dataoff;
+  const uint8_t *blob_end = blob + lc->datasize;
+  struct dyld_chained_fixups_header *h = (struct dyld_chained_fixups_header *)blob;
+  if (h->fixups_version != 0 || h->starts_offset + 4 > lc->datasize ||
+      h->symbols_offset > lc->datasize)
+    return -1;
+
+  uint32_t isize = h->imports_format == DYLD_CHAINED_IMPORT_ADDEND64 ? 16 :
+                   h->imports_format == DYLD_CHAINED_IMPORT_ADDEND ? 8 : 4;
+  if (h->imports_format < DYLD_CHAINED_IMPORT ||
+      h->imports_format > DYLD_CHAINED_IMPORT_ADDEND64 ||
+      (uint64_t)h->imports_offset + (uint64_t)h->imports_count * isize > lc->datasize) {
+    fprintf(stderr, "  chained fixups: bad imports table\n");
+    return -1;
+  }
+  // every import resolved up front, name and addend
+  uint64_t *import_vals = calloc(h->imports_count ? h->imports_count : 1, sizeof(uint64_t));
+  if (!import_vals)
+    return -1;
+  const char *syms = (const char *)blob + h->symbols_offset;
+  for (uint32_t i = 0; i < h->imports_count; i++) {
+    const uint8_t *e = blob + h->imports_offset + (size_t)i * isize;
+    uint64_t name_off, addend = 0;
+    if (h->imports_format == DYLD_CHAINED_IMPORT_ADDEND64) {
+      name_off = r64(e) >> 32;
+      addend = r64(e + 8);
+    } else {
+      name_off = r32(e) >> 9;
+      if (h->imports_format == DYLD_CHAINED_IMPORT_ADDEND)
+        addend = (uint64_t)(int64_t)(int32_t)r32(e + 4);
+    }
+    if ((const uint8_t *)syms + name_off >= blob_end) {
+      free(import_vals);
+      return -1;
+    }
+    import_vals[i] = resolve_import(kernel_syms, syms + name_off, trampoline) + addend;
+  }
+
+  uint8_t *starts = blob + h->starts_offset;
+  uint32_t seg_count = r32(starts);
+  uint64_t image_base = nseginfo ? seginfo[0].vmaddr : 0;
+  int rc = 0;
+  for (uint32_t si = 0; si < seg_count && si < nseginfo && !rc; si++) {
+    uint32_t seg_off = r32(starts + 4 + 4 * si);
+    if (!seg_off)
+      continue;
+    const uint8_t *s = starts + seg_off;
+    if (s + 22 > blob_end) { rc = -1; break; }
+    uint16_t page_size = *(const uint16_t *)(s + 4);
+    uint16_t format = *(const uint16_t *)(s + 6);
+    uint64_t segment_offset = r64(s + 8);
+    uint16_t page_count = *(const uint16_t *)(s + 20);
+    if (format != DYLD_CHAINED_PTR_64 && format != DYLD_CHAINED_PTR_64_OFFSET) {
+      fprintf(stderr, "  chained fixups: pointer format %u not supported\n", format);
+      rc = -1;
+      break;
+    }
+    for (uint32_t pi = 0; pi < page_count; pi++) {
+      uint16_t start = *(const uint16_t *)(s + 22 + 2 * pi);
+      if (start == DYLD_CHAINED_PTR_START_NONE_)
+        continue;
+      uint64_t vm = image_base + segment_offset + (uint64_t)pi * page_size + start;
+      for (;;) {
+        uint8_t *loc = seg_loc(buf, sl, seginfo, nseginfo, vm, 8);
+        if (!loc) { rc = -1; break; }
+        uint64_t raw = r64(loc);
+        uint64_t next = (raw >> 51) & 0xfff;
+        uint64_t val;
+        if (raw >> 63) {
+          uint32_t ordinal = raw & 0xffffff;
+          uint64_t addend = (raw >> 24) & 0xff;
+          if (ordinal >= h->imports_count) { rc = -1; break; }
+          val = import_vals[ordinal] + addend;
+        } else {
+          uint64_t target = raw & 0xfffffffffULL;
+          uint64_t high8 = (raw >> 36) & 0xff;
+          if (format == DYLD_CHAINED_PTR_64_OFFSET)
+            target += image_base;
+          val = (high8 << 56) | (target + load_vmaddr);
+        }
+        w64(loc, val);
+        slot_add(slots, vm + load_vmaddr);
+        if (!next)
+          break;
+        vm += next * 4;
+      }
+      if (rc)
+        break;
+    }
+  }
+  free(import_vals);
+  if (rc) {
+    fprintf(stderr, "  chained fixups: malformed chain\n");
+    return rc;
+  }
+  // the slots hold final values now, an empty starts table keeps them that way
+  w32(starts, 0);
+  return 0;
+}
+
+// mh_kext_bundle keeps its fixups as classic external and local relocations,
+// pointers only since calls out of a riscv or arm64 kext go through stubs
+static void apply_dysymtab_relocs(uint8_t *buf, size_t sl, const MachoView *mv,
+                                  const struct dysymtab_command *ds,
+                                  const SegInfo *seginfo, uint32_t nseginfo,
+                                  const uint64_t *sym_addrs, uint32_t nsyms,
+                                  uint64_t load_vmaddr, uint32_t *nerrs,
+                                  SlotList *slots) {
+  // x86_64 kext bundles bind call sites and count from __DATA, they link as mh_bundle instead
+  if (mv->cputype == CPU_TYPE_X86_64) {
+    fprintf(stderr, "  WARN: x86_64 MH_KEXT_BUNDLE relocations not applied\n");
+    return;
+  }
+  // external addresses are absolute, local ones count from the first segment
+  uint64_t ext_base = 0;
+  uint64_t loc_base = nseginfo ? seginfo[0].vmaddr : 0;
+  for (int local = 0; local < 2; local++) {
+    uint32_t off = local ? ds->locreloff : ds->extreloff;
+    uint32_t n = local ? ds->nlocrel : ds->nextrel;
+    if (!n || (uint64_t)off + (uint64_t)n * sizeof(struct relocation_info) > sl)
+      continue;
+    const struct relocation_info *rel = (const struct relocation_info *)(buf + off);
+    for (uint32_t i = 0; i < n; i++) {
+      struct relocation_info r = rel[i];
+      if (r.r_type != 0 || r.r_pcrel || r.r_length < RL_LONG ||
+          (int32_t)r.r_address < 0) {
+        fprintf(stderr, "  WARN: unhandled %s relocation type %u\n",
+                local ? "local" : "external", r.r_type);
+        continue;
+      }
+      bool is64 = r.r_length == RL_QUAD;
+      uint64_t vm = (local ? loc_base : ext_base) + (uint32_t)r.r_address;
+      uint8_t *loc = seg_loc(buf, sl, seginfo, nseginfo, vm, is64 ? 8 : 4);
+      if (!loc)
+        continue;
+      if (r.r_extern) {
+        uint64_t target = r.r_symbolnum < nsyms ? sym_addrs[r.r_symbolnum] : 0;
+        if (!target)
+          (*nerrs)++;
+        wptr(loc, rptr(loc, is64) + target, is64);
+      } else {
+        wptr(loc, rptr(loc, is64) + load_vmaddr, is64);
+      }
+      if (is64)
+        slot_add(slots, vm + load_vmaddr);
+    }
+  }
+}
+
 int link_kext(const uint8_t *kext_data, size_t kext_size,
               const SymTable *kernel_syms,
               uint64_t load_vmaddr,
@@ -996,9 +1215,12 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     return -1;
   }
   const int is_arm32 = (mv.cputype == CPU_TYPE_ARM);
+  SlotList slots = {0};
 
   const struct symtab_command *symcmd = NULL;
   const uint8_t *dyld_info = NULL;   // LC_DYLD_INFO(_ONLY) command
+  uint8_t *chained = NULL;           // LC_DYLD_CHAINED_FIXUPS command
+  const struct dysymtab_command *dysym = NULL;
   SegInfo seginfo[32];
   uint32_t nseginfo = 0;
 
@@ -1027,6 +1249,10 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
       symcmd = (const struct symtab_command *)lcp;
     } else if (cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY) {
       dyld_info = lcp;
+    } else if (cmd == LC_DYLD_CHAINED_FIXUPS) {
+      chained = lcp;
+    } else if (cmd == LC_DYSYMTAB) {
+      dysym = (const struct dysymtab_command *)lcp;
     }
   }
 
@@ -1220,6 +1446,13 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
             continue;
           }
 
+          // final riscv images never carry section relocations
+          if (mv.cputype == CPU_TYPE_RISCV64) {
+            fprintf(stderr, "  WARN: riscv section relocation type %u left unapplied\n",
+                    r.r_type);
+            continue;
+          }
+
           if (r.r_type == X86_64_RELOC_SUBTRACTOR) {
             if (ri + 1 >= sec.nreloc) continue;
             struct relocation_info r2 = relocs[++ri];
@@ -1293,8 +1526,26 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     }
   }
 
+  if (dysym && macho_hdr_filetype(&mv, buf) == MH_KEXT_BUNDLE)
+    apply_dysymtab_relocs(buf, sl, &mv, dysym, seginfo, nseginfo, sym_addrs,
+                          nsyms, load_vmaddr, &nerrs, &slots);
+
   if (nerrs)
     fprintf(stderr, "  link_kext: %u unresolved symbols\n", nerrs);
+
+  if (chained && nseginfo) {
+    uint64_t trampoline = symtab_lookup(kernel_syms, "_panic");
+    if (!trampoline)
+      trampoline = symtab_lookup(kernel_syms, "panic");
+    if (apply_chained_fixups(buf, sl, chained, seginfo, nseginfo, load_vmaddr,
+                             kernel_syms, trampoline, &slots) != 0) {
+      free(slots.v);
+      free(sym_addrs);
+      free(sec_refs);
+      free(buf);
+      return -1;
+    }
+  }
 
   if (dyld_info && nseginfo) {
     const struct dyld_info_command *di = (const struct dyld_info_command *)dyld_info;
@@ -1306,6 +1557,9 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
     // Map a (segment index, segment offset) target to a file location in buf.
     #define TARGET_LOC(seg_ix, seg_off) \
       ((seg_ix) < nseginfo ? buf + seginfo[seg_ix].fileoff + (seg_off) : NULL)
+    #define NOTE_SLOT(seg_ix, seg_off) \
+      do { if (mv.is64 && (seg_ix) < nseginfo) \
+        slot_add(&slots, seginfo[seg_ix].vmaddr + (seg_off) + load_vmaddr); } while (0)
 
     // Rebase: add the slide (load_vmaddr) to each pointer slot.
     if (di->rebase_size) {
@@ -1338,7 +1592,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
         case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
           for (uint32_t k = 0; k < imm; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64);
+            if (loc) { wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64); NOTE_SLOT(seg_ix, seg_off); }
             seg_off += ptr_size;
           }
           break;
@@ -1346,14 +1600,14 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint64_t cnt = read_uleb(&p, end);
           for (uint64_t k = 0; k < cnt; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64);
+            if (loc) { wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64); NOTE_SLOT(seg_ix, seg_off); }
             seg_off += ptr_size;
           }
           break;
         }
         case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: {
           uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-          if (loc) wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64);
+          if (loc) { wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64); NOTE_SLOT(seg_ix, seg_off); }
           seg_off += ptr_size + read_uleb(&p, end);
           break;
         }
@@ -1362,7 +1616,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint64_t skip = read_uleb(&p, end);
           for (uint64_t k = 0; k < cnt; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc) wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64);
+            if (loc) { wptr(loc, rptr(loc, mv.is64) + load_vmaddr, mv.is64); NOTE_SLOT(seg_ix, seg_off); }
             seg_off += ptr_size + skip;
           }
           break;
@@ -1401,7 +1655,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
       } while (0)
       #define DO_ONE_BIND() do { \
         uint8_t *loc = TARGET_LOC(seg_ix, seg_off); \
-        if (loc && symval) wptr(loc, symval + addend, mv.is64); \
+        if (loc && symval) { wptr(loc, symval + addend, mv.is64); NOTE_SLOT(seg_ix, seg_off); } \
         seg_off += ptr_size; \
       } while (0)
       while (p < end && !done) {
@@ -1455,7 +1709,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
           uint64_t skip = read_uleb(&p, end);
           for (uint64_t k = 0; k < cnt; k++) {
             uint8_t *loc = TARGET_LOC(seg_ix, seg_off);
-            if (loc && symval) wptr(loc, symval + addend, mv.is64);
+            if (loc && symval) { wptr(loc, symval + addend, mv.is64); NOTE_SLOT(seg_ix, seg_off); }
             seg_off += ptr_size + skip;
           }
           break;
@@ -1470,6 +1724,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
       #undef DO_ONE_BIND
     }
     #undef TARGET_LOC
+    #undef NOTE_SLOT
   }
 
   size_t strtab_size = 0;
@@ -1483,6 +1738,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   free(sec_refs);
 
   if (relayout_va_consistent(&buf, &sl) != 0) {
+    free(slots.v);
     free(buf);
     return -1;
   }
@@ -1491,5 +1747,7 @@ int link_kext(const uint8_t *kext_data, size_t kext_size,
   out->linked_size = sl;
   out->load_vmaddr = load_vmaddr;
   out->kmod_info_addr = kmod_info_addr;
+  out->ptr_slots = slots.v;
+  out->nptr_slots = slots.n;
   return 0;
 }

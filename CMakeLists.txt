@@ -16,6 +16,7 @@ set(shared_lib
 add_executable(kc-builder
   src/kc_builder.c
   src/fileset.c
+  src/auxkc.c
   ${shared_lib}
 )
 target_include_directories(kc-builder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

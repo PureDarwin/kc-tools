@@ -7,6 +7,8 @@
 #include "linker.h"
 #include "plist.h"
 #include "prelink.h"
+#include "auxkc.h"
+#include "macho_fmt.h"
 
 static uint8_t *read_file(const char *path, size_t *out_size) {
   FILE *f = fopen(path, "rb");
@@ -124,6 +126,7 @@ static void usage(const char *prog) {
   fprintf(stderr,
     "Usage: %s -kernel <file> -kext <dir.kext> [...] -o <output>\n"
     "       [-prefix /System/Library/Extensions] [-kext-vmbase <hex>] [-classic]\n"
+    "       [-aux-kext <dir.kext> [...] -aux-o <output> [-boot-kc <file>]]\n"
     "\n"
     "  Builds a prelinked kernel Mach-O from a base kernel and kext bundles.\n"
     "  Links each kext against the kernel symbol table, applies x86_64\n"
@@ -136,11 +139,110 @@ static void usage(const char *prog) {
     "  kernel_mach_header_is_in_fileset() check sees a non-fileset kernel\n"
     "  and skips kernel_collection_slide() entirely (the \"kcgen-style KC\"\n"
     "  path), sidestepping its address-computation bug for this synthetic\n"
-    "  __KCHDR layout (see fileset.c's kchdr_vmaddr comment).\n",
+    "  __KCHDR layout (see fileset.c's kchdr_vmaddr comment).\n"
+    "\n"
+    "  -aux-kext also links those kexts into an auxiliary collection at -aux-o,\n"
+    "  against the boot KC the other arguments describe. -boot-kc checks that\n"
+    "  KC is byte for byte the one this run builds before writing the aux KC.\n",
     prog);
 }
 
 #define MAX_KEXTS 64
+
+// the boot KC's base for level 0 fixups: xnu's PE_set_kc_header takes the lowest vmaddr of any header segment
+static uint64_t kc_header_base(const uint8_t *kc, size_t size)
+{
+  const struct mach_header_64 *mh = (const struct mach_header_64 *)kc;
+  const uint8_t *p = kc + sizeof(*mh);
+  uint64_t lowest = UINT64_MAX;
+
+  if (size < sizeof(*mh))
+    return 0;
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    const struct load_command *lc = (const struct load_command *)p;
+    if (lc->cmd == LC_SEGMENT_64) {
+      const struct segment_command_64 *sc = (const struct segment_command_64 *)p;
+      if (sc->vmaddr < lowest)
+        lowest = sc->vmaddr;
+    }
+    p += lc->cmdsize;
+  }
+  return lowest == UINT64_MAX ? 0 : lowest;
+}
+
+// links out-of-tree kexts against the boot KC just built, into an auxiliary KC
+static int link_aux(const uint8_t *boot_kc, size_t boot_size, const char *boot_kc_path,
+                    SymTable *syms, const uint8_t boot_uuid[16],
+                    const char **paths, int npaths, const char *output)
+{
+  if (boot_kc_path) {
+    size_t have_size = 0;
+    uint8_t *have = read_file(boot_kc_path, &have_size);
+    int same = have && have_size == boot_size && !memcmp(have, boot_kc, boot_size);
+    free(have);
+    if (!same) {
+      fprintf(stderr, "aux: %s is not the boot KC these inputs build, refusing to link against it\n",
+              boot_kc_path);
+      return -1;
+    }
+  }
+
+  uint64_t boot_base = kc_header_base(boot_kc, boot_size);
+  if (!boot_base) {
+    fprintf(stderr, "aux: cannot find the boot KC's base\n");
+    return -1;
+  }
+
+  static KextBundle bundles[MAX_KEXTS];
+  static LinkedKext linked[MAX_KEXTS];
+  int nlinked = 0;
+  uint64_t cursor = AUXKC_HEADER_SIZE;
+  uint8_t aux_uuid[16];
+
+  memcpy(aux_uuid, boot_uuid, 16);
+  for (int i = 0; i < npaths; i++) {
+    KextBundle *kb = &bundles[i];
+    if (load_kext(paths[i], "/Library/Extensions", kb) != 0) {
+      fprintf(stderr, "aux: cannot read %s\n", paths[i]);
+      return -1;
+    }
+    LinkedKext *lk = &linked[nlinked];
+    memset(lk, 0, sizeof(*lk));
+    strncpy(lk->bundle_id, kb->id, sizeof(lk->bundle_id) - 1);
+    strncpy(lk->bundle_path, kb->bundle_path, sizeof(lk->bundle_path) - 1);
+    strncpy(lk->version, kb->version, sizeof(lk->version) - 1);
+    lk->info_plist_xml = kb->info_plist_xml;
+    lk->info_plist_len = kb->info_plist_len;
+    cursor = ALIGN_UP_64(cursor, 0x1000);
+    // an aux kext that does not link would only fail later in the kernel, stop here
+    if (link_kext(kb->binary, kb->binary_size, syms, cursor, lk) != 0) {
+      fprintf(stderr, "aux: link_kext failed for %s\n", kb->id);
+      return -1;
+    }
+    patch_kmod_info(lk);
+    symtab_merge_from_linked(syms, lk);
+    cursor += ALIGN_UP_64(lk->vm_extent ? lk->vm_extent : lk->linked_size, 0x1000);
+    kc_uuid_hash(kb->binary, kb->binary_size, aux_uuid);
+    kc_uuid_hash(kb->info_plist_xml, kb->info_plist_len, aux_uuid);
+    fprintf(stderr, "aux kext: %s v%s at 0x%llx\n", lk->bundle_id, lk->version,
+            (unsigned long long)lk->load_vmaddr);
+    nlinked++;
+  }
+  kc_uuid_finish(aux_uuid);
+
+  uint8_t *out = NULL;
+  size_t out_size = 0;
+  if (auxkc_assemble(linked, (size_t)nlinked, boot_base, boot_uuid, aux_uuid, &out, &out_size) != 0) {
+    fprintf(stderr, "aux: auxkc_assemble failed\n");
+    return -1;
+  }
+  if (write_file(output, out, out_size) != 0)
+    return -1;
+  fprintf(stderr, "wrote aux KC %s (%zu bytes, %d kexts, boot KC base 0x%llx)\n",
+          output, out_size, nlinked, (unsigned long long)boot_base);
+  free(out);
+  return 0;
+}
 
 int main(int argc, char *argv[]) {
   const char *kernel_path = NULL;
@@ -153,6 +255,10 @@ int main(int argc, char *argv[]) {
   uint64_t kext_vmbase = 0;
   uint64_t kc_base = 0;
   int classic = 0;
+  const char *aux_paths[MAX_KEXTS];
+  int num_aux_paths = 0;
+  const char *aux_output = NULL;
+  const char *boot_kc_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-kernel") && i + 1 < argc) {
@@ -171,6 +277,12 @@ int main(int argc, char *argv[]) {
       kc_base = strtoull(argv[++i], NULL, 16);
     } else if (!strcmp(argv[i], "-classic")) {
       classic = 1;
+    } else if (!strcmp(argv[i], "-aux-kext") && i + 1 < argc) {
+      if (num_aux_paths < MAX_KEXTS) aux_paths[num_aux_paths++] = argv[++i];
+    } else if (!strcmp(argv[i], "-aux-o") && i + 1 < argc) {
+      aux_output = argv[++i];
+    } else if (!strcmp(argv[i], "-boot-kc") && i + 1 < argc) {
+      boot_kc_path = argv[++i];
     } else {
       fprintf(stderr, "unknown argument: %s\n", argv[i]);
       usage(argv[0]);
@@ -178,6 +290,7 @@ int main(int argc, char *argv[]) {
     }
   }
   if (!kernel_path || !output_path) { usage(argv[0]); return 1; }
+  if ((num_aux_paths > 0) != (aux_output != NULL)) { usage(argv[0]); return 1; }
 
   size_t kernel_size;
   uint8_t *kernel_data = read_file(kernel_path, &kernel_size);
@@ -337,6 +450,21 @@ int main(int argc, char *argv[]) {
     nlinked++;
   }
 
+  // the boot KC id covers everything that decides its bytes
+  uint8_t boot_uuid[16] = {0};
+  kc_uuid_hash(kernel_data, kernel_size, boot_uuid);
+  kc_uuid_hash(&kc_base, sizeof(kc_base), boot_uuid);
+  for (int i = 0; i < nlinked; i++) {
+    kc_uuid_hash(linked[i].bundle_id, strlen(linked[i].bundle_id), boot_uuid);
+    if (linked[i].info_plist_xml)
+      kc_uuid_hash(linked[i].info_plist_xml, linked[i].info_plist_len, boot_uuid);
+    if (linked[i].linked_data)
+      kc_uuid_hash(linked[i].linked_data, linked[i].linked_size, boot_uuid);
+  }
+  kc_uuid_finish(boot_uuid);
+  memcpy(kc_prelink_uuid, boot_uuid, 16);
+  kc_prelink_uuid_set = 1;
+
   uint8_t *out_data = NULL;
   size_t out_size = 0;
   if (classic) {
@@ -354,6 +482,10 @@ int main(int argc, char *argv[]) {
   if (write_file(output_path, out_data, out_size) != 0)
     return 1;
   fprintf(stderr, "wrote %s (%zu bytes)\n", output_path, out_size);
+
+  if (aux_output && link_aux(out_data, out_size, boot_kc_path, &ksyms, boot_uuid,
+                             aux_paths, num_aux_paths, aux_output) != 0)
+    return 1;
 
   free(out_data);
   free(kernel_data);

@@ -7,6 +7,10 @@
 #include <stdio.h>
 
 #define PAGE 0x1000ULL
+
+// the collection's id, xnu reads it as the boot KC uuid that an aux KC must name
+uint8_t kc_prelink_uuid[16];
+int kc_prelink_uuid_set;
 #define ALIGN_UP(x, a) (((uint64_t)(x) + ((uint64_t)(a) - 1)) & ~((uint64_t)(a) - 1))
 
 static void put32(uint8_t *p, uint32_t v) {
@@ -101,6 +105,8 @@ int prelink_assemble(const uint8_t *kernel_data, size_t kernel_size,
   }
   PlistNode *info_root = plist_new_dict();
   plist_dict_set(info_root, "_PrelinkInfoDictionary", info_array);
+  if (kc_prelink_uuid_set)
+    plist_dict_set(info_root, "_PrelinkKCID", plist_new_data(kc_prelink_uuid, 16));
   size_t info_xml_len = 0;
   char *info_xml = plist_write_xml(info_root, &info_xml_len);
   plist_free(info_root);

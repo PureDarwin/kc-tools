@@ -147,7 +147,7 @@ static void usage(const char *prog) {
     prog);
 }
 
-#define MAX_KEXTS 64
+#define MAX_KEXTS 256
 
 // the boot KC's base for level 0 fixups: xnu's PE_set_kc_header takes the lowest vmaddr of any header segment
 static uint64_t kc_header_base(const uint8_t *kc, size_t size)
